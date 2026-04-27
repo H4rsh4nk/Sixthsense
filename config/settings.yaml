@@ -89,6 +89,15 @@ data:
   db_path: "data/swing_trader.db"
   price_history_years: 3
 
+agent:
+  enabled: true
+  provider: "ollama"  # gemini, openai, anthropic, ollama, together, groq, etc.
+  model: "ollama/llama3.1:8b"  # LiteLLM format
+  temperature: 0.2
+  max_tool_calls: 5
+  fallback_to_rules: true
+  api_base: "http://localhost:11434"  # Custom base URL (for Ollama: http://localhost:11434, vLLM, etc.)
+
 logging:
   level: INFO
   file: "logs/swing_trader.log"

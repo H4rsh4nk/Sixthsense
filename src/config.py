@@ -119,6 +119,16 @@ class DataConfig(BaseModel):
     price_history_years: int = 3
 
 
+class AgentConfig(BaseModel):
+    enabled: bool = False
+    provider: str = "gemini"  # gemini, openai, anthropic, ollama, together, etc.
+    model: str = "gemini/gemini-2.0-flash"  # LiteLLM format: provider/model
+    temperature: float = 0.2
+    max_tool_calls: int = 5
+    fallback_to_rules: bool = True
+    api_base: str = ""  # Custom API base URL (for Ollama, vLLM, etc.)
+
+
 class LoggingConfig(BaseModel):
     level: str = "INFO"
     file: str = "logs/swing_trader.log"
@@ -129,6 +139,7 @@ class SecretsConfig(BaseModel):
     alpaca_secret_key: str = ""
     telegram_bot_token: str = ""
     sec_edgar_user_agent: str = ""
+    llm_api_key: str = ""  # API key for the LLM provider (Gemini/OpenAI/Anthropic/etc.)
 
 
 class AppConfig(BaseModel):
@@ -141,6 +152,7 @@ class AppConfig(BaseModel):
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
     data: DataConfig = Field(default_factory=DataConfig)
+    agent: AgentConfig = Field(default_factory=AgentConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     secrets: SecretsConfig = Field(default_factory=SecretsConfig)
 
@@ -173,6 +185,17 @@ def load_config(settings_path: Path | None = None, secrets_path: Path | None = N
         ),
         sec_edgar_user_agent=os.getenv(
             "SEC_EDGAR_USER_AGENT", secrets_data.get("sec_edgar", {}).get("user_agent", "")
+        ),
+        llm_api_key=os.getenv(
+            "LLM_API_KEY",
+            secrets_data.get("llm", {}).get("api_key",
+                # Fallback: check provider-specific keys
+                secrets_data.get("gemini", {}).get("api_key",
+                    secrets_data.get("openai", {}).get("api_key",
+                        secrets_data.get("anthropic", {}).get("api_key", "")
+                    )
+                )
+            )
         ),
     )
 
