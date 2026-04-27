@@ -28,11 +28,17 @@ class TradeCandidate:
 
 
 class SignalScorer:
-    """Combines signals from multiple generators into ranked trade candidates."""
+    """Combines signals from multiple generators into ranked trade candidates.
+
+    Supports two modes:
+    - Rules mode (default): weighted average of signal strengths
+    - Agent mode: LLM-powered decision making with tool-calling
+    """
 
     def __init__(self, config: AppConfig, db: Database):
         self.config = config
         self.db = db
+        self.agent_mode = config.agent.enabled
         self.weight_map = {
             "insider": config.signals.insider.weight,
             "news": config.signals.news.weight,
@@ -40,14 +46,82 @@ class SignalScorer:
             "price_action": config.signals.price_action.weight,
         }
 
+        # Initialize the LLM agent if enabled
+        self._agent = None
+        if self.agent_mode:
+            try:
+                from src.strategy.llm_agent import TradingAgent
+                self._agent = TradingAgent(config, db)
+                logger.info(
+                    f"Agent mode enabled: provider={config.agent.provider}, "
+                    f"model={config.agent.model}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to initialize LLM agent: {e}")
+                if not config.agent.fallback_to_rules:
+                    raise
+                logger.warning("Falling back to rule-based scoring")
+                self.agent_mode = False
+
     def score(
         self, signals: list[SignalResult], as_of_date: date
     ) -> list[TradeCandidate]:
-        """Score and rank signal results into trade candidates.
+        """Score and rank signal results into trade candidates."""
+        if self.agent_mode and self._agent is not None:
+            return self._score_with_agent(signals, as_of_date)
+        return self._score_with_rules(signals, as_of_date)
 
-        Groups signals by ticker, computes weighted combined score,
-        and filters by minimum thresholds.
-        """
+    def _score_with_agent(
+        self, signals: list[SignalResult], as_of_date: date
+    ) -> list[TradeCandidate]:
+        """Use the LLM agent to score and rank signals."""
+        try:
+            decisions = self._agent.decide(signals, as_of_date)
+
+            # Build a lookup for signals by ticker
+            by_ticker: dict[str, list[SignalResult]] = {}
+            for sig in signals:
+                by_ticker.setdefault(sig.ticker, []).append(sig)
+
+            candidates = []
+            for d in decisions:
+                ticker = d["ticker"]
+                ticker_signals = by_ticker.get(ticker, [])
+                sector = self._get_sector(ticker)
+
+                candidates.append(TradeCandidate(
+                    ticker=ticker,
+                    combined_score=d["score"],
+                    direction=d["direction"],
+                    signal_sources=d.get("signal_sources", [s.signal_type for s in ticker_signals]),
+                    num_signals=len(ticker_signals),
+                    signals=ticker_signals,
+                    sector=sector,
+                    metadata={
+                        "decision_mode": "agent",
+                        "reasoning": d.get("reasoning", ""),
+                        "model": self.config.agent.model,
+                        "individual_scores": {
+                            s.signal_type: {"strength": s.strength, "confidence": s.confidence}
+                            for s in ticker_signals
+                        },
+                    },
+                ))
+
+            logger.info(f"Agent scored {len(candidates)} candidates from {len(signals)} signals")
+            return candidates
+
+        except Exception as e:
+            logger.error(f"Agent scoring failed: {e}", exc_info=True)
+            if self.config.agent.fallback_to_rules:
+                logger.warning("Falling back to rule-based scoring")
+                return self._score_with_rules(signals, as_of_date)
+            return []
+
+    def _score_with_rules(
+        self, signals: list[SignalResult], as_of_date: date
+    ) -> list[TradeCandidate]:
+        """Original rule-based scoring: weighted average of signal strengths."""
         # Group by ticker
         by_ticker: dict[str, list[SignalResult]] = {}
         for sig in signals:
@@ -90,6 +164,7 @@ class SignalScorer:
                 signals=sigs,
                 sector=sector,
                 metadata={
+                    "decision_mode": "rules",
                     "individual_scores": {
                         s.signal_type: {"strength": s.strength, "confidence": s.confidence}
                         for s in sigs
@@ -109,3 +184,4 @@ class SignalScorer:
             )
             row = cursor.fetchone()
             return row["sector"] if row else ""
+
