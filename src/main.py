@@ -147,6 +147,20 @@ def run_live(args):
             except Exception as e:
                 logger.error(f"  {gen.signal_type} failed: {e}")
 
+        # Persist signals to local database
+        import json
+        signal_rows = []
+        for s in all_signals:
+            signal_rows.append({
+                "signal_date": s.signal_date.isoformat() if hasattr(s.signal_date, "isoformat") else s.signal_date,
+                "ticker": s.ticker,
+                "signal_type": s.signal_type,
+                "strength": s.strength,
+                "direction": s.direction,
+                "metadata": json.dumps(s.metadata) if s.metadata else "{}"
+            })
+        db.insert_signals(signal_rows)
+
         candidates = scorer.score(all_signals, today)
         logger.info(f"  Scored candidates: {len(candidates)}")
 
@@ -282,11 +296,18 @@ def run_live(args):
     ), id="overnight")
 
     mode = "PAPER" if config.broker.paper else "LIVE"
+    decision_mode = f"AI Agent ({config.agent.model})" if config.agent.enabled else "Rules"
     logger.info(f"Starting swing-trader in {mode} mode...")
+    logger.info(f"Decision mode: {decision_mode}")
     logger.info(f"Schedule: pre={sched.pre_market}, entry={sched.market_open_entry}, "
                 f"close={sched.market_close_exit}, post={sched.post_market}")
 
     try:
+        if getattr(args, "now", False):
+            logger.info("Executing immediate manual scan (--now flag passed)")
+            pre_market_scan()
+            market_open_entry()
+            
         scheduler.start()
     except KeyboardInterrupt:
         logger.info("Shutting down...")
@@ -308,6 +329,7 @@ def main():
 
     # Live/paper trading command
     live = subparsers.add_parser("trade", help="Run live/paper trading")
+    live.add_argument("--now", action="store_true", help="Trigger an immediate scan and entry cycle on startup")
 
     # Data download command
     data = subparsers.add_parser("download", help="Download historical data only")

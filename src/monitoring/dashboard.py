@@ -16,8 +16,14 @@ import streamlit as st
 
 from src.config import load_config
 from src.database import Database
+from src.execution.broker import AlpacaBroker
 
 st.set_page_config(page_title="Swing Trader Dashboard", layout="wide")
+
+@st.cache_resource
+def get_broker():
+    config = load_config()
+    return AlpacaBroker(config)
 
 
 @st.cache_resource
@@ -41,7 +47,8 @@ def main():
     if page == "Overview":
         render_overview(db)
     elif page == "Open Positions":
-        render_open_positions(db)
+        broker = get_broker()
+        render_open_positions(db, broker)
     elif page == "Trade History":
         render_trade_history(db)
     elif page == "Equity Curve":
@@ -85,13 +92,26 @@ def render_overview(db: Database):
         st.info("No trades yet.")
 
 
-def render_open_positions(db: Database):
+def render_open_positions(db: Database, broker: AlpacaBroker = None):
     """Open positions page."""
     st.header("Open Positions")
 
+    # Add Live Broker Positions
+    if broker:
+        st.subheader("Live Broker Positions (Alpaca)")
+        try:
+            live_positions = broker.get_positions()
+            if live_positions:
+                st.dataframe(pd.DataFrame(live_positions), use_container_width=True)
+            else:
+                st.info("No active positions on Alpaca.")
+        except Exception as e:
+            st.error(f"Failed to load live positions: {e}")
+
+    st.subheader("Database Tracked Positions")
     trades = db.get_open_trades()
     if not trades:
-        st.info("No open positions.")
+        st.info("No open trades tracked in the local database.")
         return
 
     df = pd.DataFrame(trades)
@@ -102,8 +122,10 @@ def render_open_positions(db: Database):
     for trade in trades:
         with st.expander(f"{trade['ticker']} — {trade['direction'].upper()}"):
             col1, col2, col3 = st.columns(3)
-            col1.write(f"**Entry:** ${trade['entry_price']:.2f}")
-            col2.write(f"**Stop Loss:** ${trade['stop_loss_price']:.2f}")
+            entry = f"${trade['entry_price']:.2f}" if trade['entry_price'] is not None else "Pending"
+            stop = f"${trade['stop_loss_price']:.2f}" if trade['stop_loss_price'] is not None else "N/A"
+            col1.write(f"**Entry:** {entry}")
+            col2.write(f"**Stop Loss:** {stop}")
             col3.write(f"**Shares:** {trade['shares']}")
             st.write(f"Signal: {trade['signal_type']} (score: {trade['signal_score']:.2f})")
             st.write(f"Target Exit: {trade['target_exit_date']}")

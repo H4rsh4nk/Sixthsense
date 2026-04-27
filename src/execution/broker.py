@@ -78,8 +78,8 @@ class AlpacaBroker:
         return [
             {
                 "ticker": p.symbol,
-                "qty": int(p.qty),
-                "side": "long" if int(p.qty) > 0 else "short",
+                "qty": float(p.qty),
+                "side": "long" if float(p.qty) > 0 else "short",
                 "entry_price": float(p.avg_entry_price),
                 "current_price": float(p.current_price),
                 "market_value": float(p.market_value),
