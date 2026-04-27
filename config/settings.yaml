@@ -1,0 +1,94 @@
+trading:
+  mode: paper  # paper | live
+  capital: 10000
+  risk_per_trade_pct: 0.02
+  max_drawdown_pct: 0.10
+  max_concurrent_positions: 3
+  max_single_position_pct: 0.30  # never more than 30% of account in one stock
+  max_sector_positions: 2
+  daily_loss_limit_pct: 0.03
+
+exit_rules:
+  default_hold_days: 5
+  stop_loss_pct: 0.05
+  trailing_stop: false
+  trailing_stop_pct: 0.03
+  # For backtesting parameter sweep:
+  sweep_hold_days: [3, 5, 10, 15]
+  sweep_stop_loss_pct: [0.03, 0.05, 0.07]
+
+signals:
+  insider:
+    enabled: true
+    lookback_days: 2
+    min_transaction_value: 100000
+    cluster_window_days: 7
+    weight: 0.35
+  news:
+    enabled: true
+    sentiment_threshold: 0.6
+    min_articles: 2
+    weight: 0.25
+  political:
+    enabled: true
+    event_types:
+      - tariff
+      - executive_order
+      - fed_meeting
+      - sanctions
+      - trade_deal
+    weight: 0.20
+  price_action:
+    enabled: true
+    indicators:
+      - rsi
+      - macd
+      - volume_spike
+    rsi_oversold: 30
+    rsi_overbought: 70
+    volume_spike_multiplier: 2.0
+    weight: 0.20
+
+scoring:
+  min_combined_score: 0.3
+  min_signals_agreeing: 1
+
+backtest:
+  start_date: "2023-01-01"
+  end_date: "2025-12-31"
+  slippage_pct: 0.001
+  spread_pct: 0.0005
+  initial_capital: 10000
+  walk_forward_train_years: 2
+  walk_forward_test_years: 1
+
+broker:
+  name: alpaca
+  paper: true
+  base_url_paper: "https://paper-api.alpaca.markets"
+  base_url_live: "https://api.alpaca.markets"
+  entry_delay_minutes: 5  # wait 5 min after open
+  exit_before_close_minutes: 5
+
+scheduler:
+  pre_market: "08:00"
+  market_open_entry: "09:35"
+  intraday_check_interval_minutes: 30
+  market_close_exit: "15:55"
+  post_market: "17:00"
+  overnight_scan: "23:00"
+  timezone: "US/Eastern"
+
+alerts:
+  telegram_enabled: false
+  telegram_chat_id: ""
+
+data:
+  universe: "sp500"  # sp500 | custom
+  custom_tickers: []
+  db_path: "data/swing_trader.db"
+  price_history_years: 3
+
+logging:
+  level: INFO
+  file: "logs/swing_trader.log"

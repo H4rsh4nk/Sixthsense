@@ -1,0 +1,22 @@
+services:
+  trader:
+    build: .
+    container_name: swing-trader
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config/secrets.yaml:/app/config/secrets.yaml:ro
+    environment:
+      - PYTHONPATH=/app
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    container_name: swing-dashboard
+    command: ["streamlit", "run", "src/monitoring/dashboard.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./config/secrets.yaml:/app/config/secrets.yaml:ro
+    restart: unless-stopped
