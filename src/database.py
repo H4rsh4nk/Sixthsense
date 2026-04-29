@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS trades (
     direction TEXT NOT NULL,  -- long, short
     signal_type TEXT NOT NULL,
     signal_score REAL NOT NULL,
+    entry_reason TEXT,
     entry_date TEXT NOT NULL,
     entry_price REAL NOT NULL,
     shares REAL NOT NULL,
@@ -107,6 +108,27 @@ CREATE TABLE IF NOT EXISTS trades (
 );
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker);
+
+-- Decision trace log (selected + rejected candidates)
+CREATE TABLE IF NOT EXISTS decision_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_time TEXT NOT NULL,
+    decision_date TEXT NOT NULL,
+    stage TEXT NOT NULL,  -- pre_market | market_open | manual
+    mode TEXT NOT NULL,   -- agent | rules
+    ticker TEXT NOT NULL,
+    direction TEXT,
+    score REAL,
+    selected INTEGER NOT NULL,  -- 1=yes, 0=no
+    signal_sources TEXT,  -- comma-separated
+    reasoning TEXT,
+    rejection_reason TEXT,
+    signal_details TEXT,  -- JSON details for each signal
+    agent_trace TEXT,  -- JSON trace (tool calls, raw model output)
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_decision_logs_date ON decision_logs(decision_date);
+CREATE INDEX IF NOT EXISTS idx_decision_logs_stage ON decision_logs(stage);
 
 -- Daily equity snapshots
 CREATE TABLE IF NOT EXISTS equity_snapshots (
@@ -140,6 +162,21 @@ class Database:
     def _init_schema(self):
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate_schema(conn)
+
+    def _migrate_schema(self, conn: sqlite3.Connection):
+        """Apply lightweight non-destructive schema migrations."""
+        cursor = conn.execute("PRAGMA table_info(trades)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        if "entry_reason" not in columns:
+            conn.execute("ALTER TABLE trades ADD COLUMN entry_reason TEXT")
+        cursor = conn.execute("PRAGMA table_info(decision_logs)")
+        decision_cols = {row["name"] for row in cursor.fetchall()}
+        if decision_cols:
+            if "signal_details" not in decision_cols:
+                conn.execute("ALTER TABLE decision_logs ADD COLUMN signal_details TEXT")
+            if "agent_trace" not in decision_cols:
+                conn.execute("ALTER TABLE decision_logs ADD COLUMN agent_trace TEXT")
 
     @contextmanager
     def connect(self):
@@ -238,12 +275,14 @@ class Database:
 
     def insert_trade(self, trade: dict) -> int:
         """Insert a trade record and return its ID."""
+        trade = {**trade}
+        trade.setdefault("entry_reason", "")
         with self.connect() as conn:
             cursor = conn.execute(
                 """INSERT INTO trades
-                   (ticker, direction, signal_type, signal_score, entry_date,
+                   (ticker, direction, signal_type, signal_score, entry_reason, entry_date,
                     entry_price, shares, stop_loss_price, target_exit_date, status)
-                   VALUES (:ticker, :direction, :signal_type, :signal_score, :entry_date,
+                   VALUES (:ticker, :direction, :signal_type, :signal_score, :entry_reason, :entry_date,
                            :entry_price, :shares, :stop_loss_price, :target_exit_date, :status)""",
                 trade,
             )
@@ -276,6 +315,31 @@ class Database:
         with self.connect() as conn:
             cursor = conn.execute(
                 "SELECT * FROM trades WHERE status = 'open' ORDER BY entry_date"
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def insert_decision_logs(self, rows: list[dict]):
+        """Bulk insert decision trace rows."""
+        if not rows:
+            return
+        with self.connect() as conn:
+            conn.executemany(
+                """INSERT INTO decision_logs
+                   (decision_time, decision_date, stage, mode, ticker, direction, score,
+                    selected, signal_sources, reasoning, rejection_reason, signal_details, agent_trace)
+                   VALUES (:decision_time, :decision_date, :stage, :mode, :ticker, :direction, :score,
+                           :selected, :signal_sources, :reasoning, :rejection_reason, :signal_details, :agent_trace)""",
+                rows,
+            )
+
+    def get_recent_decision_logs(self, limit: int = 300) -> list[dict]:
+        """Get recent decision traces."""
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """SELECT * FROM decision_logs
+                   ORDER BY decision_time DESC, id DESC
+                   LIMIT ?""",
+                (limit,),
             )
             return [dict(row) for row in cursor.fetchall()]
 

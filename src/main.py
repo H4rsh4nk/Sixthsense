@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from datetime import date, datetime
@@ -23,6 +24,32 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("swing_trader")
+
+def persist_decision_trace(db, scorer, stage: str, when: date):
+    """Persist latest scorer decision trace to DB."""
+    trace = getattr(scorer, "last_decision_trace", []) or []
+    if not trace:
+        return
+
+    decision_time = datetime.now().isoformat()
+    rows = []
+    for d in trace:
+        rows.append({
+            "decision_time": decision_time,
+            "decision_date": when.isoformat(),
+            "stage": stage,
+            "mode": d.get("mode", "unknown"),
+            "ticker": d.get("ticker", ""),
+            "direction": d.get("direction", ""),
+            "score": d.get("score"),
+            "selected": 1 if d.get("selected") else 0,
+            "signal_sources": ",".join(d.get("signal_sources", [])),
+            "reasoning": d.get("reasoning", ""),
+            "rejection_reason": d.get("rejection_reason", ""),
+            "signal_details": json.dumps(d.get("signal_details", [])),
+            "agent_trace": json.dumps(d.get("agent_trace", {})),
+        })
+    db.insert_decision_logs(rows)
 
 
 def run_backtest(args):
@@ -148,7 +175,6 @@ def run_live(args):
                 logger.error(f"  {gen.signal_type} failed: {e}")
 
         # Persist signals to local database
-        import json
         signal_rows = []
         for s in all_signals:
             signal_rows.append({
@@ -162,6 +188,7 @@ def run_live(args):
         db.insert_signals(signal_rows)
 
         candidates = scorer.score(all_signals, today)
+        persist_decision_trace(db, scorer, stage="pre_market", when=today)
         logger.info(f"  Scored candidates: {len(candidates)}")
 
         for c in candidates[:10]:
@@ -192,6 +219,7 @@ def run_live(args):
                 pass
 
         candidates = scorer.score(all_signals, today)
+        persist_decision_trace(db, scorer, stage="market_open", when=today)
 
         for candidate in candidates:
             trade_id = order_manager.enter_trade(candidate)
@@ -220,6 +248,23 @@ def run_live(args):
 
         if closed:
             logger.info(f"  Closed {len(closed)} positions")
+
+    def heartbeat():
+        """Periodic heartbeat to confirm backend health."""
+        try:
+            account = broker.get_account()
+            status = risk_manager.get_status(account.equity)
+            logger.info(
+                "HEARTBEAT | mode=%s | equity=$%0.2f | open_positions=%s/%s | drawdown=%0.2f%% | circuit_breaker=%s",
+                "PAPER" if config.broker.paper else "LIVE",
+                account.equity,
+                status["open_positions"],
+                status["max_positions"],
+                status["drawdown_pct"] * 100,
+                status["circuit_breaker_active"],
+            )
+        except Exception as e:
+            logger.error(f"HEARTBEAT FAILED: {e}")
 
     def post_market_review():
         """Post-market: daily P&L review and equity snapshot."""
@@ -287,6 +332,11 @@ def run_live(args):
         id="intraday"
     )
 
+    scheduler.add_job(heartbeat, "interval",
+        minutes=sched.heartbeat_interval_minutes,
+        id="heartbeat"
+    )
+
     scheduler.add_job(post_market_review, CronTrigger(
         hour=post_h, minute=post_m, day_of_week="mon-fri"
     ), id="post_market")
@@ -301,6 +351,7 @@ def run_live(args):
     logger.info(f"Decision mode: {decision_mode}")
     logger.info(f"Schedule: pre={sched.pre_market}, entry={sched.market_open_entry}, "
                 f"close={sched.market_close_exit}, post={sched.post_market}")
+    logger.info(f"Heartbeat interval: every {sched.heartbeat_interval_minutes} minutes")
 
     try:
         if getattr(args, "now", False):

@@ -101,6 +101,7 @@ class SchedulerConfig(BaseModel):
     pre_market: str = "08:00"
     market_open_entry: str = "09:35"
     intraday_check_interval_minutes: int = 30
+    heartbeat_interval_minutes: int = 15
     market_close_exit: str = "15:55"
     post_market: str = "17:00"
     overnight_scan: str = "23:00"

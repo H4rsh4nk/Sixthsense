@@ -13,6 +13,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import json
 
 from src.config import load_config
 from src.database import Database
@@ -41,7 +42,7 @@ def main():
     page = st.sidebar.selectbox(
         "Navigate",
         ["Overview", "Open Positions", "Trade History", "Equity Curve",
-         "Signal Pipeline", "Backtest Results"],
+         "Signal Pipeline", "Decision Log", "Backtest Results"],
     )
 
     if page == "Overview":
@@ -55,6 +56,8 @@ def main():
         render_equity_curve(db)
     elif page == "Signal Pipeline":
         render_signal_pipeline(db)
+    elif page == "Decision Log":
+        render_decision_log(db)
     elif page == "Backtest Results":
         render_backtest_results()
 
@@ -128,6 +131,8 @@ def render_open_positions(db: Database, broker: AlpacaBroker = None):
             col2.write(f"**Stop Loss:** {stop}")
             col3.write(f"**Shares:** {trade['shares']}")
             st.write(f"Signal: {trade['signal_type']} (score: {trade['signal_score']:.2f})")
+            if trade.get("entry_reason"):
+                st.write(f"Reason: {trade['entry_reason']}")
             st.write(f"Target Exit: {trade['target_exit_date']}")
 
 
@@ -228,6 +233,76 @@ def render_signal_pipeline(db: Database):
     filtered = df[df["signal_type"].isin(selected)]
 
     st.dataframe(filtered, use_container_width=True)
+
+
+def render_decision_log(db: Database):
+    """Decision trace page: shows selected/rejected candidates with reasoning."""
+    st.header("Decision Log")
+
+    rows = db.get_recent_decision_logs(limit=500)
+    if not rows:
+        st.info("No decision logs yet. Run a scan/trade cycle first.")
+        return
+
+    df = pd.DataFrame(rows)
+    df["selected"] = df["selected"].astype(bool)
+
+    col1, col2, col3 = st.columns(3)
+    mode_options = sorted(df["mode"].dropna().unique().tolist())
+    stage_options = sorted(df["stage"].dropna().unique().tolist())
+    selected_modes = col1.multiselect("Mode", mode_options, default=mode_options)
+    selected_stages = col2.multiselect("Stage", stage_options, default=stage_options)
+    selected_flag = col3.selectbox("Decision type", ["All", "Selected", "Rejected"])
+
+    filtered = df[df["mode"].isin(selected_modes) & df["stage"].isin(selected_stages)]
+    if selected_flag == "Selected":
+        filtered = filtered[filtered["selected"]]
+    elif selected_flag == "Rejected":
+        filtered = filtered[~filtered["selected"]]
+
+    st.subheader("Latest Decisions")
+    st.dataframe(filtered, use_container_width=True)
+
+    st.subheader("Reasoning Details")
+    for row in filtered.head(50).to_dict(orient="records"):
+        verdict = "SELECTED" if row["selected"] else "REJECTED"
+        title = (
+            f"{row['decision_time']} | {row['ticker']} | {verdict} | "
+            f"mode={row['mode']} stage={row['stage']}"
+        )
+        with st.expander(title):
+            st.write(f"Direction: {row.get('direction') or 'n/a'}")
+            st.write(f"Score: {row.get('score')}")
+            st.write(f"Signals: {row.get('signal_sources') or 'n/a'}")
+            if row.get("reasoning"):
+                st.write(f"Reasoning: {row['reasoning']}")
+            if row.get("rejection_reason"):
+                st.write(f"Rejection reason: {row['rejection_reason']}")
+            signal_details_raw = row.get("signal_details")
+            if signal_details_raw:
+                try:
+                    details = json.loads(signal_details_raw)
+                except Exception:
+                    details = []
+                if details:
+                    st.write("Signal details:")
+                    for sd in details:
+                        st.write(
+                            f"- {sd.get('signal_type')} | dir={sd.get('direction')} | "
+                            f"strength={sd.get('strength')} | confidence={sd.get('confidence')}"
+                        )
+                        meta = sd.get("metadata") or {}
+                        if meta:
+                            st.json(meta)
+            agent_trace_raw = row.get("agent_trace")
+            if agent_trace_raw:
+                try:
+                    agent_trace = json.loads(agent_trace_raw)
+                except Exception:
+                    agent_trace = {}
+                if agent_trace:
+                    st.write("Agent trace:")
+                    st.json(agent_trace)
 
 
 def render_backtest_results():

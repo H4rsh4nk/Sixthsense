@@ -1,11 +1,11 @@
 trading:
   mode: paper  # paper | live
-  capital: 10000
-  risk_per_trade_pct: 0.02
+  capital: 100000
+  risk_per_trade_pct: 0.005
   max_drawdown_pct: 0.10
-  max_concurrent_positions: 3
-  max_single_position_pct: 0.30  # never more than 30% of account in one stock
-  max_sector_positions: 2
+  max_concurrent_positions: 10
+  max_single_position_pct: 0.10  # cap each position at 10% while evaluating decisions
+  max_sector_positions: 4
   daily_loss_limit_pct: 0.03
 
 exit_rules:
@@ -58,7 +58,7 @@ backtest:
   end_date: "2025-12-31"
   slippage_pct: 0.001
   spread_pct: 0.0005
-  initial_capital: 10000
+  initial_capital: 100000
   walk_forward_train_years: 2
   walk_forward_test_years: 1
 
@@ -74,6 +74,7 @@ scheduler:
   pre_market: "08:00"
   market_open_entry: "09:35"
   intraday_check_interval_minutes: 30
+  heartbeat_interval_minutes: 15
   market_close_exit: "15:55"
   post_market: "17:00"
   overnight_scan: "23:00"

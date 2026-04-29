@@ -179,6 +179,7 @@ class TradingAgent:
         self._model = config.agent.model
         self._temperature = config.agent.temperature
         self._max_tool_calls = config.agent.max_tool_calls
+        self.last_trace: dict[str, Any] = {}
 
         # Set the API key for the configured provider
         self._setup_provider(config)
@@ -256,6 +257,12 @@ class TradingAgent:
 
     def _run_agent_loop(self, system: str, user_message: str) -> list[dict[str, Any]]:
         """Run the agent loop: call model → handle tool calls → repeat until done."""
+        self.last_trace = {
+            "model": self._model,
+            "tool_calls": [],
+            "final_response": "",
+            "forced_final_answer": False,
+        }
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user_message},
@@ -282,6 +289,7 @@ class TradingAgent:
             # No tool calls → model is done, extract text
             if not assistant_msg.tool_calls:
                 text = assistant_msg.content or "[]"
+                self.last_trace["final_response"] = text
                 return self._parse_decisions(text)
 
             # Process tool calls
@@ -293,6 +301,11 @@ class TradingAgent:
 
                 logger.info(f"Agent tool call: {fn_name}({fn_args})")
                 result = self._execute_tool(fn_name, fn_args)
+                self.last_trace["tool_calls"].append({
+                    "name": fn_name,
+                    "args": fn_args,
+                    "result_preview": result[:1000],
+                })
 
                 messages.append({
                     "role": "tool",
@@ -303,6 +316,7 @@ class TradingAgent:
 
         # Hit tool call limit — force a final answer without tools
         logger.warning(f"Agent hit tool call limit ({self._max_tool_calls}), forcing final answer")
+        self.last_trace["forced_final_answer"] = True
         messages.append({
             "role": "user",
             "content": "You've used all available tool calls. Provide your final trade recommendations now as a JSON array.",
@@ -318,6 +332,7 @@ class TradingAgent:
 
         response = litellm.completion(**kwargs)
         text = response.choices[0].message.content or "[]"
+        self.last_trace["final_response"] = text
         return self._parse_decisions(text)
 
     def _format_signals(self, signals: list[SignalResult], as_of_date: date) -> str:

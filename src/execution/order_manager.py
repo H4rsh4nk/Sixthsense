@@ -38,7 +38,7 @@ class OrderManager:
 
         # Track broker order IDs → trade IDs for reconciliation
         self._order_map: dict[str, int] = {}  # broker_order_id → db_trade_id
-        self._stop_orders: dict[int, str] = {}  # db_trade_id → stop_order_id
+        # self._stop_orders removed in favor of OTO orders and ticker-based cancelation
 
     def enter_trade(self, candidate: TradeCandidate) -> int | None:
         """Execute a trade entry for a candidate.
@@ -76,6 +76,7 @@ class OrderManager:
             ticker=candidate.ticker,
             qty=size.shares,
             side="buy" if candidate.direction == "long" else "sell",
+            stop_loss_price=size.stop_loss_price,
         )
 
         if "error" in order.status:
@@ -92,6 +93,7 @@ class OrderManager:
             "direction": candidate.direction,
             "signal_type": ",".join(candidate.signal_sources),
             "signal_score": candidate.combined_score,
+            "entry_reason": candidate.metadata.get("reasoning", ""),
             "entry_date": today.isoformat(),
             "entry_price": price,
             "shares": size.shares,
@@ -102,23 +104,15 @@ class OrderManager:
 
         self._order_map[order.order_id] = trade_id
 
-        # Place stop-loss order
-        stop = self.broker.place_stop_order(
-            ticker=candidate.ticker,
-            qty=size.shares,
-            stop_price=round(size.stop_loss_price, 2),
-            side="sell" if candidate.direction == "long" else "buy",
-        )
-
-        if stop.order_id:
-            self._stop_orders[trade_id] = stop.order_id
+        # Stop-loss order is now handled via OTO on the entry order.
 
         self.exit_manager.register_trade(trade_id, price)
 
         logger.info(
             f"ENTERED: {candidate.direction.upper()} {size.shares} x {candidate.ticker} "
             f"@ ${price:.2f} | Stop: ${size.stop_loss_price:.2f} | "
-            f"Exit by: {target_exit} | Score: {candidate.combined_score:.2f}"
+            f"Exit by: {target_exit} | Score: {candidate.combined_score:.2f} | "
+            f"Reason: {candidate.metadata.get('reasoning', 'n/a')}"
         )
         return trade_id
 
@@ -136,9 +130,9 @@ class OrderManager:
             if price is None:
                 continue
 
-            # Cancel the existing stop order if we're exiting for another reason
-            if exit_sig.reason != "stop_loss" and trade_id in self._stop_orders:
-                self.broker.cancel_order(self._stop_orders[trade_id])
+            # Cancel all open orders (like attached stop losses) for this ticker
+            if exit_sig.reason != "stop_loss":
+                self.broker.cancel_open_orders(ticker)
 
             # Get open trade details
             open_trades = self.db.get_open_trades()
@@ -202,10 +196,9 @@ class OrderManager:
             )
             closed.append(exit_sig.trade_id)
 
-        # Cancel all stop orders
-        for trade_id, order_id in self._stop_orders.items():
-            self.broker.cancel_order(order_id)
-        self._stop_orders.clear()
+        # Cancel all open orders for the closed positions
+        for exit_sig in exits:
+            self.broker.cancel_open_orders(exit_sig.ticker)
 
         return closed
 

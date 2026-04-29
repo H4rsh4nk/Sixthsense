@@ -89,17 +89,25 @@ class AlpacaBroker:
             for p in positions
         ]
 
-    def place_market_order(self, ticker: str, qty: int, side: str = "buy") -> OrderResult:
-        """Place a market order."""
+    def place_market_order(
+        self, ticker: str, qty: int, side: str = "buy", stop_loss_price: float | None = None
+    ) -> OrderResult:
+        """Place a market order, optionally as an OTO order with a stop loss attached."""
         logger.info(f"Placing {side.upper()} market order: {qty} x {ticker}")
         try:
-            order = self.api.submit_order(
-                symbol=ticker,
-                qty=qty,
-                side=side,
-                type="market",
-                time_in_force="day",
-            )
+            kwargs = {
+                "symbol": ticker,
+                "qty": qty,
+                "side": side,
+                "type": "market",
+                "time_in_force": "day",
+            }
+            if stop_loss_price is not None:
+                kwargs["order_class"] = "oto"
+                kwargs["stop_loss"] = {"stop_price": str(round(stop_loss_price, 2))}
+                logger.info(f"Attached stop loss at ${stop_loss_price:.2f}")
+
+            order = self.api.submit_order(**kwargs)
             return OrderResult(
                 order_id=order.id,
                 ticker=ticker,
@@ -159,6 +167,17 @@ class AlpacaBroker:
             return True
         except Exception as e:
             logger.error(f"Cancel order failed: {order_id}: {e}")
+            return False
+
+    def cancel_open_orders(self, ticker: str) -> bool:
+        """Cancel all open orders for a ticker."""
+        try:
+            orders = self.api.list_orders(status="open", symbols=[ticker])
+            for order in orders:
+                self.api.cancel_order(order.id)
+            return True
+        except Exception as e:
+            logger.error(f"Cancel open orders failed for {ticker}: {e}")
             return False
 
     def get_order_status(self, order_id: str) -> OrderResult | None:
