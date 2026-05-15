@@ -109,6 +109,7 @@ Aspirational layers and labels are described in [GOAL_ARCHITECTURE.md](GOAL_ARCH
 ## 6) Decision AI (LLM + rules)
 
 - **TradingAgent** when `agent.enabled`: portfolio-aware reasoning with bounded tool calls — the single "decision agent" per ADR-0002.
+- **Agent tool registry (ADR-0010, Phase A)**: `src/agent/tool_registry.py` exposes the system to the agent as a uniform tool surface — `get_portfolio_state`, `get_price_history`, `compute_indicators`, `get_news_sentiment`, `get_insider_filings`, `get_political_events`, `get_macro_regime`, `query_regression_alerts`, `get_signal_source_stats`, `get_rules_ranking`, and (gated) `submit_paper_trade`. Each tool has an explicit JSON schema (`Tool.openai_schema()`) and is exercised end-to-end by `scripts/smoketest.py`. **No live caller uses the registry yet** — Phase B will rewire `TradingAgent` to call it; Phase D (per ADR-0011) will add per-call logging into `tool_call_log` (schema stub already migrated).
 - **RiskManager** (deterministic rules, not an agent): circuit breaker, daily loss limits, drawdown tracking, concurrency caps from `trading`.
 - **PositionSizer** / **ExitManager**: position sizing against risk config and timed or stop-based exits (`exit_rules`).
 - **Sizing modes (ADR-0003)**: `trading.sizing_mode` is `fixed_risk` (default) or `fractional_kelly`. Kelly mode pulls per-source win-rate and avg win/loss from closed trades (`Database.get_signal_kelly_inputs`), computes per-source `f* = (p·b − (1−p))/b`, averages across the candidate's sources, multiplies by `kelly_fraction`, and clamps to `min(kelly_max_position_pct, max_single_position_pct)`. Any contributing source with fewer than `kelly_min_trades_per_source` closed trades downgrades the candidate to fixed-risk for that entry. `PositionSize` records `sizing_mode_used`, `kelly_target_pct`, `per_source_kelly`, and any `kelly_fallback_reason`; the entry log line surfaces them.
@@ -117,6 +118,7 @@ Aspirational layers and labels are described in [GOAL_ARCHITECTURE.md](GOAL_ARCH
 ## 7) Execution layer
 
 - **OrderManager** orchestrates entries and exits. `reconcile()` compares broker positions vs DB-open trades and warns on drift; it is also wired as the recovery hook for the broker circuit breaker.
+- **Dry-run mode (ADR-0010, Phase C)**: `swing-trader trade --dry-run` constructs `OrderManager` with `dry_run=True`. Signals, scoring, risk gating, and sizing all execute normally; broker submissions and `trades` rows are suppressed. A single log line per would-be entry captures direction, size, stop, score, and reasoning — used by `TESTING.md` step 2 to validate the full pipeline against real data without committing capital.
 - **AlpacaBroker** is the single-broker path. **BrokerCascade** is used when `broker.fallback_enabled` is true and provides a **sticky failover circuit breaker** (ADR-0004): primary failures past `broker.failover_failure_threshold` trip the breaker to `open`, subsequent calls go straight to fallback for `broker.failover_cooldown_seconds`, then `half_open` probes primary; success closes the breaker and triggers `OrderManager.reconcile()`.
 - **Deferred**: a *non-Alpaca* fallback broker (IBKR, Tradier, etc.) is **not** implemented. The current fallback is a second set of Alpaca credentials.
 
@@ -145,6 +147,8 @@ Architectural decisions live in [`docs/decisions/`](docs/decisions/README.md). E
 | §6 (human gate, planned) | [ADR-0005](docs/decisions/0005-human-approval-flow.md) | Telegram approve/deny for trades above a $ / % threshold |
 | §7 (execution) | [ADR-0004](docs/decisions/0004-sticky-broker-failover.md) | Circuit-breaker sticky failover with cooldown and recovery reconciliation |
 | §8 (monitoring) | [ADR-0006](docs/decisions/0006-performance-regression-not-retraining.md) | Win-rate / Sharpe regression checks; drift deferred to ADR-0009 |
+| §6 (agent tools), §7 (dry-run) | [ADR-0010](docs/decisions/0010-agent-as-decision-driver.md) | Agent as central decision driver; tool registry + dry-run delivered (Phase A + C) |
+| §6 (agent tools) | [ADR-0011](docs/decisions/0011-agent-budgets-caching-observability.md) | Per-phase budgets, slow-tool caching, `tool_call_log` observability (schema stub) |
 | Goal-doc-wide | [ADR-0001](docs/decisions/0001-realistic-fast-path-sla.md) | Reject literal <50 ms fast path; redefine as event-driven, <5 s SLA |
 
 New ADRs are added to `docs/decisions/` with sequential numbering. Each section above links the ADR(s) that explain *why* the design choice exists.
@@ -159,6 +163,10 @@ This section summarises code changes landed since the last revision of this doc 
 - **decision_logs observability columns** (`src/database.py`) — `latency_ms` and `model_cost_usd` columns added via migration; populated by future work.
 - **Fractional-Kelly sizing** (`src/strategy/position_sizer.py`, `src/database.py::get_signal_kelly_inputs`, `src/execution/order_manager.py`) — ADR-0003. Adds `trading.sizing_mode`, `kelly_fraction`, `kelly_min_trades_per_source`, `kelly_max_position_pct` config knobs. `fractional_kelly` mode falls back transparently to `fixed_risk` per-candidate when a contributing source has too few closed trades.
 - **Performance regression detection** (`src/monitoring/regression.py`, `regression_alerts` table, `monitoring.*` config block) — ADR-0006. Runs from `post_market_review`; logs warnings, persists to `regression_alerts`, and emits Telegram alerts when enabled.
+- **Agent tool registry** (`src/agent/__init__.py`, `src/agent/tool_registry.py`) — ADR-0010 Phase A. Behaviour-neutral: defines `Tool`, `ToolContext`, `ToolResult`, `ToolError`, `build_default_registry`, `execute_tool` so Phase B can swap `TradingAgent`'s internal scaffolding for a single uniform call surface.
+- **Dry-run trading** (`src/main.py` CLI + `src/execution/order_manager.py`) — ADR-0010 Phase C. `--dry-run` flag plus `OrderManager.dry_run` short-circuits broker submissions and DB writes.
+- **`tool_call_log` schema stub** (`src/database.py`) — ADR-0011. Table migrated; population deferred to Phase B/β.
+- **End-to-end smoke test** (`scripts/smoketest.py`, `TESTING.md`) — exercises calendar, schema, sizer, risk manager, phase-state, regression detector, sticky failover, yfinance ingest, and every read-only tool against a temp DB.
 - **Dependency**: `exchange_calendars >= 4.5` added to `requirements.txt` and `pyproject.toml`.
 
-Future improvements (not yet landed): ADR-0005 (Telegram approval flow); ADR-0009 (drift-KL definition for distribution regression).
+Future improvements (not yet landed): ADR-0005 (Telegram approval flow); ADR-0009 (drift-KL definition for distribution regression); ADR-0010 Phase B (agent becomes the orchestrator) and Phase D (full per-call observability).
