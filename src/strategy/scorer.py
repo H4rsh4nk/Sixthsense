@@ -45,6 +45,8 @@ class SignalScorer:
             "political": config.signals.political.weight,
             "price_action": config.signals.price_action.weight,
         }
+        if config.signals.macro.enabled:
+            self.weight_map["macro"] = config.signals.macro.weight
         self.last_decision_trace: list[dict[str, Any]] = []
         # Initialize the LLM agent if enabled
         self._agent = None
@@ -62,6 +64,12 @@ class SignalScorer:
                     raise
                 logger.warning("Falling back to rule-based scoring")
                 self.agent_mode = False
+
+    def _effective_weight(self, signal_type: str, accuracy_boost: dict[str, float]) -> float:
+        base = self.weight_map.get(signal_type, 0.25)
+        if self.config.scoring.accuracy_weight_adjustment and accuracy_boost:
+            return float(base * accuracy_boost.get(signal_type, 1.0))
+        return float(base)
 
     @staticmethod
     def _signal_details(signals: list[SignalResult]) -> list[dict[str, Any]]:
@@ -174,16 +182,77 @@ class SignalScorer:
         for sig in signals:
             by_ticker.setdefault(sig.ticker, []).append(sig)
 
+        accuracy_boost = (
+            self.db.get_signal_accuracy_multipliers()
+            if self.config.scoring.accuracy_weight_adjustment
+            else {}
+        )
+
         candidates = []
         trace: list[dict[str, Any]] = []
         for ticker, sigs in by_ticker.items():
+            cb = float(self.config.scoring.conflict_balance_ratio or 0.0)
+            if cb > 0:
+                long_mass = sum(
+                    self._effective_weight(s.signal_type, accuracy_boost)
+                    * abs(s.strength)
+                    for s in sigs
+                    if s.direction == "long"
+                )
+                short_mass = sum(
+                    self._effective_weight(s.signal_type, accuracy_boost)
+                    * abs(s.strength)
+                    for s in sigs
+                    if s.direction == "short"
+                )
+                if long_mass > 1e-12 and short_mass > 1e-12:
+                    balance = min(long_mass, short_mass) / max(long_mass, short_mass)
+                    if balance >= cb:
+                        trace.append({
+                            "mode": "rules",
+                            "ticker": ticker,
+                            "direction": "",
+                            "score": None,
+                            "selected": False,
+                            "signal_sources": [s.signal_type for s in sigs],
+                            "reasoning": "",
+                            "rejection_reason": "conflicting_signal_balance",
+                            "signal_details": self._signal_details(sigs),
+                            "agent_trace": {},
+                        })
+                        continue
+
+            conf_values = [
+                float(s.confidence) for s in sigs if s.confidence is not None
+            ]
+            mean_conf = (
+                sum(conf_values) / len(conf_values)
+                if conf_values
+                else 1.0
+            )
+            min_ac = float(self.config.scoring.min_aggregate_confidence or 0.0)
+            if min_ac > 0 and mean_conf + 1e-9 < min_ac:
+                trace.append({
+                    "mode": "rules",
+                    "ticker": ticker,
+                    "direction": "",
+                    "score": None,
+                    "selected": False,
+                    "signal_sources": [s.signal_type for s in sigs],
+                    "reasoning": "",
+                            "rejection_reason": "below_aggregate_confidence",
+                            "signal_details": self._signal_details(sigs),
+                            "agent_trace": {},
+                        })
+                continue
+
             # Weighted combination
             weighted_sum = 0.0
             total_weight = 0.0
             direction_votes = {"long": 0, "short": 0}
 
             for sig in sigs:
-                w = self.weight_map.get(sig.signal_type, 0.25)
+                w = self._effective_weight(sig.signal_type, accuracy_boost)
                 weighted_sum += sig.strength * w
                 total_weight += w
                 direction_votes[sig.direction] += w

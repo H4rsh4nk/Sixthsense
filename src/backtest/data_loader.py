@@ -11,6 +11,10 @@ import yfinance as yf
 
 from src.config import AppConfig
 from src.database import Database
+from src.ingestion.validation import (
+    validate_ohlcv_row as _validate_ohlc_row,
+    filter_anomalous_daily_returns,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +132,7 @@ def download_price_history(
     tickers: list[str],
     years: int = 3,
     batch_size: int = 50,
+    config: AppConfig | None = None,
 ) -> None:
     """Download daily OHLCV data for all tickers and store in SQLite."""
     end_date = datetime.now()
@@ -135,9 +140,15 @@ def download_price_history(
     start_str = start_date.strftime("%Y-%m-%d")
     end_str = end_date.strftime("%Y-%m-%d")
 
-    total = len(tickers)
+    ticker_list = list(dict.fromkeys(tickers))
+    if config and config.signals.macro.enabled and config.signals.macro.benchmark_ticker:
+        bmk = config.signals.macro.benchmark_ticker
+        if bmk not in ticker_list:
+            ticker_list.append(bmk)
+
+    total = len(ticker_list)
     for i in range(0, total, batch_size):
-        batch = tickers[i : i + batch_size]
+        batch = ticker_list[i : i + batch_size]
         batch_str = " ".join(batch)
         logger.info(f"Downloading prices: batch {i // batch_size + 1} ({len(batch)} tickers)...")
 
@@ -186,8 +197,21 @@ def download_price_history(
                 continue
 
         if rows:
+            ingestion = getattr(config.data, "ingestion", None) if config else None
+            if ingestion and ingestion.validate_prices:
+                sane = [r for r in rows if _validate_ohlc_row(r)[0]]
+                skipped = len(rows) - len(sane)
+                if skipped:
+                    logger.warning("Dropped %s invalid OHLCV rows during ingest", skipped)
+                rows = sane
+                rows, anomaly_drops = filter_anomalous_daily_returns(
+                    rows, ingestion.max_single_day_return_pct
+                )
+                if anomaly_drops:
+                    logger.warning("Dropped %s anomalous return rows during ingest", anomaly_drops)
+
             db.insert_prices(rows)
-            logger.info(f"  Stored {len(rows)} price rows for {len(batch)} tickers")
+            logger.info(f"  Stored {len(rows)} price rows for batch {batch_str[:60]}...")
 
 
 def run_data_pipeline(config: AppConfig) -> Database:
@@ -198,7 +222,7 @@ def run_data_pipeline(config: AppConfig) -> Database:
     tickers = load_universe(db, config)
 
     # Step 2: Download price history
-    download_price_history(db, tickers, years=config.data.price_history_years)
+    download_price_history(db, tickers, years=config.data.price_history_years, config=config)
 
     logger.info("Data pipeline complete.")
     return db

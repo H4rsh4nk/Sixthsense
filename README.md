@@ -8,77 +8,11 @@ Sixthsense is a multi-signal swing trading engine that fuses **insider activity*
 
 ## Architecture
 
-```
-                          ┌─────────────────────────────────┐
-                          │        External Data Sources     │
-                          │                                  │
-                          │  SEC EDGAR ─── Form 4 filings   │
-                          │  Google News / FinViz ─── NLP    │
-                          │  Federal Register ─── Policy     │
-                          │  Yahoo Finance ─── OHLCV         │
-                          └──────────┬──────────────────────┘
-                                     │
-                    ┌────────────────┼────────────────┐
-                    ▼                ▼                ▼
-             ┌────────────┐  ┌────────────┐  ┌────────────────┐
-             │  Insider    │  │   News     │  │  Political     │
-             │  Signal     │  │  Signal    │  │  Signal        │
-             │             │  │  (FinBERT) │  │                │
-             └─────┬──────┘  └─────┬──────┘  └───────┬────────┘
-                   │               │                  │
-                   │    ┌──────────┘                  │
-                   │    │    ┌────────────┐           │
-                   │    │    │ Price      │           │
-                   │    │    │ Action     │           │
-                   │    │    │ Signal     │           │
-                   │    │    └─────┬──────┘           │
-                   │    │          │                  │
-                   ▼    ▼          ▼                  ▼
-              ┌──────────────────────────────────────────┐
-              │           Signal Scorer                   │
-              │   weighted aggregation + ranking          │
-              │   (insider 35% / news 25% /               │
-              │    political 20% / price 20%)             │
-              └────────────────┬─────────────────────────┘
-                               │
-                               ▼
-              ┌──────────────────────────────────────────┐
-              │          Strategy Layer                   │
-              │                                          │
-              │  ┌──────────────┐  ┌──────────────────┐  │
-              │  │ Position     │  │  Risk Manager    │  │
-              │  │ Sizer        │  │  - drawdown      │  │
-              │  │ - % risk     │  │  - circuit       │  │
-              │  │ - hard caps  │  │    breaker       │  │
-              │  └──────────────┘  │  - sector limits │  │
-              │                    └──────────────────┘  │
-              │  ┌──────────────────────────────────────┐│
-              │  │ Exit Manager                         ││
-              │  │ stop-loss · time-exit · trailing     ││
-              │  └──────────────────────────────────────┘│
-              └────────────────┬─────────────────────────┘
-                               │
-                               ▼
-              ┌──────────────────────────────────────────┐
-              │         Order Manager                     │
-              │   entry lifecycle · exit lifecycle        │
-              │   stop order tracking · reconciliation   │
-              └────────────────┬─────────────────────────┘
-                               │
-                    ┌──────────┴──────────┐
-                    ▼                     ▼
-            ┌──────────────┐     ┌──────────────┐
-            │  Alpaca API  │     │   SQLite DB  │
-            │  paper/live  │     │   (WAL mode) │
-            └──────────────┘     └──────────────┘
-                                        │
-                               ┌────────┴────────┐
-                               ▼                  ▼
-                     ┌──────────────┐    ┌──────────────┐
-                     │  Streamlit   │    │  Telegram    │
-                     │  Dashboard   │    │  Alerts      │
-                     └──────────────┘    └──────────────┘
-```
+Architecture has been moved to `ARCHITECTURE.md`, including:
+
+- system diagram
+- 24/7 phase orchestration (pre-market / in-market / post-market)
+- decision-trace and heartbeat observability model
 
 ---
 
@@ -87,7 +21,7 @@ Sixthsense is a multi-signal swing trading engine that fuses **insider activity*
 | Signal | Source | Method | Weight |
 |--------|--------|--------|--------|
 | **Insider** | SEC EDGAR Form 4 | Cluster detection — counts unique insiders buying + total dollar volume. 3+ insiders buying $500k+ = max strength | 35% |
-| **News** | Google News RSS + FinViz | **FinBERT** (financial-domain BERT) sentiment analysis on headlines. Requires ≥2 articles agreeing | 25% |
+| **News** | Google News RSS + FinViz | **Qwen 3.5 9B** sentiment classification on headlines (via Ollama/LiteLLM). Requires ≥2 articles agreeing | 25% |
 | **Political** | Federal Register API | Classifies executive orders, tariffs, sanctions, trade deals by GICS sector impact using keyword dictionaries | 20% |
 | **Price Action** | SQLite OHLCV | RSI (14), MACD crossovers, volume spikes (2x 20-day avg) | 20% |
 
@@ -126,16 +60,15 @@ All signals output a normalized `SignalResult` with strength (-1.0 to +1.0), dir
 
 ---
 
-## Daily Schedule (US/Eastern)
+## 24/7 Market Phases (US/Eastern)
 
-| Time | Job | Description |
+| Phase | Window | What Runs |
 |------|-----|-------------|
-| `23:00` | Overnight Refresh | Fetch political events, pre-score news for top 50 tickers |
-| `08:00` | Pre-Market Scan | Generate all signals, rank candidates (read-only) |
-| `09:35` | Market Open Entry | Re-score and execute entries (5 min after open) |
-| Every 30m | Intraday Check | Poll equity, enforce risk limits, process exits |
-| `15:55` | Exit Window | Close positions before market close |
-| `17:00` | Post-Market Review | Record equity snapshot |
+| `pre_market` | `pre_market` → `market_open_entry` | Signal generation + scoring |
+| `in_market` | `market_open_entry` → `market_close_exit` | Entries + periodic intraday checks |
+| `post_market` | all other times | Review, snapshots, and data refresh |
+
+The phase orchestrator runs every minute and routes work by phase. A heartbeat log runs every 15 minutes (configurable).
 
 ---
 
@@ -160,7 +93,7 @@ Event-driven simulation that replays each trading day:
 | Layer | Tech |
 |-------|------|
 | Language | Python 3.11 |
-| NLP | FinBERT via HuggingFace Transformers + PyTorch (CPU) |
+| NLP | Qwen 3.5 9B via Ollama + LiteLLM |
 | Broker | Alpaca Markets (paper + live) |
 | Data | Yahoo Finance, SEC EDGAR, Federal Register, Google News RSS, FinViz |
 | Database | SQLite (WAL mode, 7 tables) |
@@ -219,7 +152,7 @@ sixthsense/
 │   ├── signals/
 │   │   ├── base.py             # Signal ABC + SignalResult
 │   │   ├── insider.py          # SEC Form 4 cluster detection
-│   │   ├── news.py             # FinBERT sentiment analysis
+│   │   ├── news.py             # Qwen-based sentiment analysis
 │   │   ├── political.py        # Federal Register event classifier
 │   │   └── price_action.py     # RSI / MACD / volume spikes
 │   ├── strategy/

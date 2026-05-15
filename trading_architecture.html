@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Improved AI Trading System Architecture</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #ffffff;
+    --bg2: #f5f4f0;
+    --bg3: #eeece7;
+    --text: #1a1a18;
+    --text2: #5a5a56;
+    --text3: #8a8a85;
+    --border: rgba(0,0,0,0.12);
+    --border2: rgba(0,0,0,0.22);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1a1a18;
+      --bg2: #242422;
+      --bg3: #2e2e2b;
+      --text: #e8e6df;
+      --text2: #a0a09a;
+      --text3: #666660;
+      --border: rgba(255,255,255,0.12);
+      --border2: rgba(255,255,255,0.22);
+    }
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 32px 24px;
+    max-width: 800px;
+    margin: 0 auto;
+    line-height: 1.5;
+  }
+
+  h1 {
+    font-size: 20px;
+    font-weight: 500;
+    margin-bottom: 4px;
+    color: var(--text);
+  }
+
+  .subtitle {
+    font-size: 13px;
+    color: var(--text3);
+    margin-bottom: 28px;
+  }
+
+  .sh {
+    font-size: 10px;
+    font-weight: 500;
+    color: var(--text3);
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    margin: 16px 0 6px;
+    padding-bottom: 4px;
+    border-bottom: .5px solid var(--border);
+  }
+
+  .row { display: flex; gap: 7px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 7px; }
+  .grid4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 7px; }
+  .grid5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 7px; }
+
+  .b {
+    flex: 1;
+    border-radius: 8px;
+    border: .5px solid;
+    padding: 9px 11px;
+  }
+
+  .bt { font-size: 13px; font-weight: 500; margin-bottom: 2px; }
+  .bs { font-size: 11px; line-height: 1.5; }
+
+  .arr {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 22px;
+  }
+  .arrline {
+    width: 1px;
+    height: 14px;
+    background: var(--border2);
+  }
+
+  .inset {
+    background: var(--bg2);
+    border: .5px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    margin-top: 0;
+    font-size: 11px;
+    color: var(--text2);
+    line-height: 1.5;
+  }
+
+  .inset strong {
+    font-size: 11px;
+    font-weight: 500;
+    display: block;
+    margin-bottom: 2px;
+    color: var(--text);
+  }
+
+  .tag {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 500;
+    padding: 1px 5px;
+    border-radius: 99px;
+    margin-left: 4px;
+    vertical-align: middle;
+    position: relative;
+    top: -1px;
+  }
+
+  .fb {
+    margin-top: 12px;
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: .5px dashed var(--border2);
+    font-size: 11px;
+    color: var(--text3);
+    text-align: center;
+    line-height: 1.6;
+  }
+
+  /* Light mode colors */
+  .bl { background: #E6F1FB; border-color: #185FA5; }
+  .bl .bt { color: #0C447C; }
+  .bl .bs { color: #185FA5; }
+
+  .tl { background: #E1F5EE; border-color: #0F6E56; }
+  .tl .bt { color: #085041; }
+  .tl .bs { color: #0F6E56; }
+
+  .pu { background: #EEEDFE; border-color: #534AB7; }
+  .pu .bt { color: #3C3489; }
+  .pu .bs { color: #534AB7; }
+
+  .co { background: #FAECE7; border-color: #993C1D; }
+  .co .bt { color: #712B13; }
+  .co .bs { color: #993C1D; }
+
+  .am { background: #FAEEDA; border-color: #854F0B; }
+  .am .bt { color: #633806; }
+  .am .bs { color: #854F0B; }
+
+  .gr { background: var(--bg2); border-color: var(--border2); }
+  .gr .bt { color: var(--text); }
+  .gr .bs { color: var(--text2); }
+
+  .gn { background: #EAF3DE; border-color: #3B6D11; }
+  .gn .bt { color: #27500A; }
+  .gn .bs { color: #3B6D11; }
+
+  .rd { background: #FCEBEB; border-color: #A32D2D; }
+  .rd .bt { color: #791F1F; }
+  .rd .bs { color: #A32D2D; }
+
+  .pill-fast { background: #FAECE7; color: #712B13; border: .5px solid #F0997B; }
+  .pill-slow { background: #E6F1FB; color: #0C447C; border: .5px solid #85B7EB; }
+  .new-tag { background: #EAF3DE; color: #27500A; border: .5px solid #97C459; }
+  .imp-tag { background: #FAEEDA; color: #633806; border: .5px solid #EF9F27; }
+
+  @media (prefers-color-scheme: dark) {
+    .bl { background: #0C447C; border-color: #85B7EB; }
+    .bl .bt { color: #B5D4F4; }
+    .bl .bs { color: #85B7EB; }
+
+    .tl { background: #085041; border-color: #5DCAA5; }
+    .tl .bt { color: #9FE1CB; }
+    .tl .bs { color: #5DCAA5; }
+
+    .pu { background: #3C3489; border-color: #AFA9EC; }
+    .pu .bt { color: #CECBF6; }
+    .pu .bs { color: #AFA9EC; }
+
+    .co { background: #712B13; border-color: #F0997B; }
+    .co .bt { color: #F5C4B3; }
+    .co .bs { color: #F0997B; }
+
+    .am { background: #633806; border-color: #EF9F27; }
+    .am .bt { color: #FAC775; }
+    .am .bs { color: #EF9F27; }
+
+    .gn { background: #27500A; border-color: #97C459; }
+    .gn .bt { color: #C0DD97; }
+    .gn .bs { color: #97C459; }
+
+    .rd { background: #791F1F; border-color: #F09595; }
+    .rd .bt { color: #F7C1C1; }
+    .rd .bs { color: #F09595; }
+
+    .pill-fast { background: #712B13; color: #F5C4B3; border-color: #F0997B; }
+    .pill-slow { background: #0C447C; color: #B5D4F4; border-color: #85B7EB; }
+    .new-tag { background: #27500A; color: #C0DD97; border-color: #639922; }
+    .imp-tag { background: #633806; color: #FAC775; border-color: #EF9F27; }
+
+    .inset strong { color: var(--text); }
+  }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 20px;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    color: var(--text2);
+  }
+</style>
+</head>
+<body>
+
+<h1>Improved AI trading system architecture</h1>
+<p class="subtitle">Redesigned with data validation, dual-path processing, signal aggregation, and execution redundancy</p>
+
+<div class="legend">
+  <div class="legend-item"><span class="tag new-tag">NEW</span> New layer or component</div>
+  <div class="legend-item"><span class="tag imp-tag">IMPROVED</span> Substantially redesigned</div>
+</div>
+
+<!-- DATA SOURCES -->
+<div class="sh">Data sources</div>
+<div class="grid5">
+  <div class="b bl">
+    <div class="bt">Market data</div>
+    <div class="bs">Price, volume, order book, L2</div>
+  </div>
+  <div class="b bl">
+    <div class="bt">News &amp; macro</div>
+    <div class="bs">Social, govt, geopolitical</div>
+  </div>
+  <div class="b bl">
+    <div class="bt">Enterprise</div>
+    <div class="bs">Earnings, SEC filings, reports</div>
+  </div>
+  <div class="b co">
+    <div class="bt">Alt data <span class="tag new-tag">NEW</span></div>
+    <div class="bs">Options flow, dark pool, 13F filings</div>
+  </div>
+  <div class="b gr">
+    <div class="bt">External tools</div>
+    <div class="bs">Charts, search, web APIs</div>
+  </div>
+</div>
+
+<div class="arr"><div class="arrline"></div></div>
+
+<!-- VALIDATION -->
+<div class="sh">Ingestion &amp; validation <span class="tag imp-tag">IMPROVED</span></div>
+<div class="b am" style="width:100%">
+  <div class="bt">Data quality gate</div>
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:7px">
+    <div class="inset">Schema validation</div>
+    <div class="inset">Anomaly detection</div>
+    <div class="inset">Deduplication</div>
+    <div class="inset">Latency tagging</div>
+  </div>
+</div>
+
+<div class="arr"><div class="arrline"></div></div>
+
+<!-- PROCESSING PATHS -->
+<div class="sh">Processing paths <span class="tag new-tag">NEW</span></div>
+<div class="grid2">
+  <div class="b co">
+    <div style="margin-bottom:5px"><span class="tag pill-fast">Fast path — &lt;50ms</span></div>
+    <div class="bt">Real-time signals</div>
+    <div class="bs">Price spikes, breaking news, order book imbalance — bypasses deep analysis</div>
+  </div>
+  <div class="b bl">
+    <div style="margin-bottom:5px"><span class="tag pill-slow">Slow path — async</span></div>
+    <div class="bt">Deep analysis</div>
+    <div class="bs">Sentiment scoring, macro context, cross-asset correlation</div>
+  </div>
+</div>
+
+<div class="arr"><div class="arrline"></div></div>
+
+<!-- AI AGENTS -->
+<div class="sh">AI agent layer</div>
+<div class="grid4">
+  <div class="b pu">
+    <div class="bt">News agent</div>
+    <div class="bs">Qwen 3.5 9B sentiment (Ollama/LiteLLM), event detection, NER tagging</div>
+  </div>
+  <div class="b bl">
+    <div class="bt">Market agent</div>
+    <div class="bs">Technicals, order flow, pattern recognition</div>
+  </div>
+  <div class="b rd">
+    <div class="bt">Risk agent</div>
+    <div class="bs">VaR, drawdown, volatility regime, correlation</div>
+  </div>
+  <div class="b tl">
+    <div class="bt">Macro agent <span class="tag new-tag">NEW</span></div>
+    <div class="bs">Regime detection, sector rotation, rates, FX</div>
+  </div>
+</div>
+
+<div class="arr"><div class="arrline"></div></div>
+
+<!-- SIGNAL AGGREGATION -->
+<div class="sh">Signal aggregation &amp; conflict resolution <span class="tag new-tag">NEW</span></div>
+<div class="b gr" style="width:100%">
+  <div class="grid3">
+    <div>
+      <div class="bt" style="font-size:12px">Weighted ensemble</div>
+      <div class="bs">Agent outputs combined by historical accuracy and market regime</div>
+    </div>
+    <div style="border-left:.5px solid var(--border);padding-left:10px">
+      <div class="bt" style="font-size:12px">Conflict detector</div>
+      <div class="bs">Agents disagree beyond threshold → abstain or escalate to human</div>
+    </div>
+    <div style="border-left:.5px solid var(--border);padding-left:10px">
+      <div class="bt" style="font-size:12px">Confidence gate</div>
+      <div class="bs">Low confidence → no trade, write to review queue for analysis</div>
+    </div>
+  </div>
+</div>
+
+<div class="arr"><div class="arrline"></div></div>
+
+<!-- DECISION AI -->
+<div class="sh">Decision AI <span class="tag imp-tag">IMPROVED</span></div>
+<div class="b pu" style="width:100%">
+  <div class="bt">LLM + rule-based hybrid — maintains live portfolio state</div>
+  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:8px">
+    <div class="inset">
+      <strong>Portfolio context store</strong>
+      Live positions, P&amp;L, exposure, sector limits
+    </div>
+    <div class="inset">
+      <strong>Trade sizing</strong>
+      Kelly criterion with hard max-risk cap per trade
+    </div>
+    <div class="inset">
+      <strong>Entry / exit logic</strong>
+      Target price, stop loss, time horizon, partial fills
+    </div>
+    <div class="inset">
+      <strong>Pre-trade risk check</strong>
+      Position limits, drawdown gates, correlated exposure
+    </div>
+    <div class="inset">
+      <strong>Explainability log <span class="tag new-tag">NEW</span></strong>
+      Every decision + reasoning stored for audit trail
+    </div>
+    <div class="inset">
+      <strong>Human override <span class="tag new-tag">NEW</span></strong>
+      Trades above size threshold require manual approval
+    </div>
+  </div>
+</div>
+
+<div class="arr"><div class="arrline"></div></div>
+
+<!-- EXECUTION -->
+<div class="sh">Execution layer <span class="tag imp-tag">IMPROVED</span></div>
+<div class="grid3">
+  <div class="b gr">
+    <div class="bt">Order manager</div>
+    <div class="bs">Smart routing, TWAP/VWAP, slippage control, paper trade mode</div>
+  </div>
+  <div class="b tl">
+    <div class="bt">Primary broker API</div>
+    <div class="bs">Live execution, order status, fill confirmation</div>
+  </div>
+  <div class="b co">
+    <div class="bt">Fallback broker <span class="tag new-tag">NEW</span></div>
+    <div class="bs">Circuit breaker auto-switches on primary API failure or timeout</div>
+  </div>
+</div>
+
+<div class="arr"><div class="arrline"></div></div>
+
+<!-- MONITORING -->
+<div class="sh">Monitoring &amp; governance <span class="tag imp-tag">IMPROVED</span></div>
+<div class="b gn" style="width:100%">
+  <div class="bt">Continuous observability</div>
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:7px">
+    <div class="inset">Real-time P&amp;L tracking</div>
+    <div class="inset">Signal accuracy metrics</div>
+    <div class="inset">Audit trail — SOC2 ready</div>
+    <div class="inset">Model drift detection</div>
+    <div class="inset">Sharpe / Sortino ratios</div>
+    <div class="inset">Alerts &amp; incident mgmt</div>
+    <div class="inset">Regulatory compliance log</div>
+    <div class="inset">Retraining pipeline trigger</div>
+  </div>
+</div>
+
+<div class="fb">
+  ↻ Feedback loop: Monitoring → Data quality gate (bad signal flagging) → Agent retraining → Decision AI recalibration
+</div>
+
+</body>
+</html>

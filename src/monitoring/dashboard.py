@@ -42,7 +42,7 @@ def main():
     page = st.sidebar.selectbox(
         "Navigate",
         ["Overview", "Open Positions", "Trade History", "Equity Curve",
-         "Signal Pipeline", "Decision Log", "Backtest Results"],
+         "Signal Pipeline", "Decision Log", "Live Logs", "Backtest Results"],
     )
 
     if page == "Overview":
@@ -58,6 +58,8 @@ def main():
         render_signal_pipeline(db)
     elif page == "Decision Log":
         render_decision_log(db)
+    elif page == "Live Logs":
+        render_live_logs()
     elif page == "Backtest Results":
         render_backtest_results()
 
@@ -239,7 +241,19 @@ def render_decision_log(db: Database):
     """Decision trace page: shows selected/rejected candidates with reasoning."""
     st.header("Decision Log")
 
-    rows = db.get_recent_decision_logs(limit=500)
+    # Backward-compatible fallback in case an older Database object is cached
+    # by Streamlit and does not yet expose get_recent_decision_logs().
+    if hasattr(db, "get_recent_decision_logs"):
+        rows = db.get_recent_decision_logs(limit=500)
+    else:
+        with db.connect() as conn:
+            cursor = conn.execute(
+                """SELECT * FROM decision_logs
+                   ORDER BY decision_time DESC, id DESC
+                   LIMIT ?""",
+                (500,),
+            )
+            rows = [dict(row) for row in cursor.fetchall()]
     if not rows:
         st.info("No decision logs yet. Run a scan/trade cycle first.")
         return
@@ -348,6 +362,37 @@ def render_backtest_results():
     if trades:
         st.subheader(f"Trades ({len(trades)})")
         st.dataframe(pd.DataFrame(trades), use_container_width=True)
+
+
+def render_live_logs():
+    """Live log viewer for swing_trader.log."""
+    st.header("Live Logs")
+    log_path = ROOT / "logs" / "swing_trader.log"
+    if not log_path.exists():
+        st.info(f"Log file not found: {log_path}")
+        return
+
+    col1, col2, col3 = st.columns([1, 1, 1])
+    line_count = col1.selectbox("Lines", [50, 100, 200, 500], index=1)
+    level_filter = col2.selectbox(
+        "Level",
+        ["ALL", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        index=0,
+    )
+    refresh_clicked = col3.button("Refresh")
+
+    with open(log_path, encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
+
+    tail = lines[-line_count:]
+    if level_filter != "ALL":
+        tail = [ln for ln in tail if f"[{level_filter}]" in ln]
+
+    st.caption(f"Showing {len(tail)} lines from `{log_path}`")
+    st.code("".join(tail) if tail else "No matching log lines.", language="text")
+
+    if refresh_clicked:
+        st.rerun()
 
 
 if __name__ == "__main__":

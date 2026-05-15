@@ -262,7 +262,7 @@ swing-trader/
 ├── src/
 │   ├── signals/               # 4 signal generators
 │   │   ├── insider.py         # SEC Form 4 insider buying clusters
-│   │   ├── news.py            # FinBERT NLP sentiment on news
+│   │   ├── news.py            # Qwen NLP sentiment on news
 │   │   ├── political.py       # Federal Register / Congress events
 │   │   └── price_action.py    # RSI, MACD, volume spikes
 │   ├── strategy/              # Trade decision engine
@@ -295,8 +295,8 @@ swing-trader/
 ### Insider (SEC Form 4)
 Detects clusters of insider buying. When multiple executives buy stock with their own money (not planned 10b5-1 trades), it's historically a bullish signal. Academic research shows ~5–8% annual alpha.
 
-### News Sentiment (FinBERT NLP)
-Scores news headlines using FinBERT, a financial-domain language model. Aggregates sentiment per ticker. Trades when sentiment is strongly positive or negative with multiple confirming articles.
+### News Sentiment (Qwen 3.5 9B NLP)
+Scores news headlines using Qwen 3.5 9B through Ollama/LiteLLM. Aggregates sentiment per ticker. Trades when sentiment is strongly positive or negative with multiple confirming articles.
 
 ### Political Events
 Monitors the Federal Register for executive orders, tariffs, regulations, and trade deals. Maps events to affected sectors using keyword matching and estimates bullish/bearish impact.

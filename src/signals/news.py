@@ -1,4 +1,4 @@
-"""News sentiment signal generator using FinBERT NLP.
+"""News sentiment signal generator using LLM-based NLP (Qwen via Ollama/LiteLLM).
 
 Parses news from free RSS feeds and scores sentiment per ticker.
 """
@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import logging
 import re
+import json
 from datetime import date, datetime, timedelta
 from typing import Any
 
 import feedparser
+import litellm
 import requests
 
 from src.config import AppConfig
@@ -18,24 +20,6 @@ from src.database import Database
 from src.signals.base import Signal, SignalResult
 
 logger = logging.getLogger(__name__)
-
-# FinBERT model for financial sentiment (loaded lazily)
-_sentiment_pipeline = None
-
-
-def get_sentiment_pipeline():
-    """Lazy-load the FinBERT sentiment analysis pipeline."""
-    global _sentiment_pipeline
-    if _sentiment_pipeline is None:
-        logger.info("Loading FinBERT sentiment model (first time only)...")
-        from transformers import pipeline
-        _sentiment_pipeline = pipeline(
-            "sentiment-analysis",
-            model="ProsusAI/finbert",
-            tokenizer="ProsusAI/finbert",
-            device=-1,  # CPU
-        )
-    return _sentiment_pipeline
 
 
 # Free news RSS sources
@@ -56,6 +40,8 @@ class NewsSignal(Signal):
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (compatible; SwingTrader/1.0)"
         })
+        self._llm_model = config.agent.model
+        self._llm_api_base = config.agent.api_base or None
 
     def _fetch_news_google(self, ticker: str, days_back: int = 3) -> list[dict]:
         """Fetch news articles from Google News RSS."""
@@ -140,23 +126,55 @@ class NewsSignal(Signal):
         return articles
 
     def _score_sentiment(self, headlines: list[str]) -> list[dict[str, Any]]:
-        """Score sentiment of headlines using FinBERT."""
+        """Score sentiment of headlines using configured LLM (Qwen via LiteLLM)."""
         if not headlines:
             return []
-
-        pipeline = get_sentiment_pipeline()
-
-        # FinBERT has a max token length; truncate long headlines
-        truncated = [h[:512] for h in headlines]
-
+        truncated = [h[:400] for h in headlines]
+        numbered = [f"{i+1}. {h}" for i, h in enumerate(truncated)]
+        prompt = (
+            "Classify each stock-news headline as positive, negative, or neutral for the stock price.\n"
+            "Return JSON only in this format:\n"
+            '{"results":[{"index":1,"label":"positive|negative|neutral","confidence":0.0}]}\n'
+            f"Headlines:\n{chr(10).join(numbered)}"
+        )
         try:
-            results = pipeline(truncated)
-            scored = []
-            for headline, result in zip(headlines, results):
-                label = result["label"]  # positive, negative, neutral
-                score = result["score"]  # confidence
+            kwargs: dict[str, Any] = {
+                "model": self._llm_model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a strict financial sentiment classifier. Output valid JSON only.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.0,
+            }
+            if self._llm_api_base:
+                kwargs["api_base"] = self._llm_api_base
 
-                # Map to [-1, 1] scale
+            response = litellm.completion(**kwargs)
+            content = (response.choices[0].message.content or "").strip()
+            if content.startswith("```"):
+                lines = [l for l in content.split("\n") if not l.strip().startswith("```")]
+                content = "\n".join(lines).strip()
+            parsed = json.loads(content)
+            llm_results = parsed.get("results", []) if isinstance(parsed, dict) else []
+
+            by_index: dict[int, dict[str, Any]] = {}
+            for item in llm_results:
+                if not isinstance(item, dict):
+                    continue
+                idx = int(item.get("index", 0))
+                if idx <= 0:
+                    continue
+                by_index[idx] = item
+
+            scored = []
+            for i, headline in enumerate(headlines, start=1):
+                result = by_index.get(i, {})
+                label = str(result.get("label", "neutral")).lower()
+                score = float(result.get("confidence", 0.5))
+                score = max(0.0, min(1.0, score))
                 if label == "positive":
                     sentiment = score
                 elif label == "negative":
@@ -172,7 +190,7 @@ class NewsSignal(Signal):
                 })
             return scored
         except Exception as e:
-            logger.error(f"FinBERT scoring failed: {e}")
+            logger.error(f"LLM sentiment scoring failed: {e}")
             return []
 
     def _get_articles_from_db(self, ticker: str, as_of_date: date, days_back: int = 3) -> list[dict]:

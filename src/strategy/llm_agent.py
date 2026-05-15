@@ -25,8 +25,8 @@ SYSTEM_PROMPT = """You are an expert swing trader AI assistant. Your job is to a
 trading signals and decide which stocks to trade.
 
 ## Your Role
-- You receive raw signals from 4 sources: insider filings (SEC Form 4), news sentiment 
-  (FinBERT NLP), political events (Federal Register), and price action (RSI/MACD/volume).
+- You receive raw signals from 4 sources: insider filings (SEC Form 4), news sentiment
+  (LLM-classified headlines), political events (Federal Register), and price action (RSI/MACD/volume).
 - You have tools to query additional data: prices, positions, risk status, etc.
 - You must decide which signals are worth trading and rank them by conviction.
 
@@ -56,7 +56,7 @@ trade decisions. Each decision must have:
     "ticker": "AAPL",
     "direction": "long",
     "score": 0.85,
-    "reasoning": "3 insiders bought $2M+ in last 5 days, FinBERT sentiment 0.82 across 4 articles, RSI at 32 (oversold). Strong multi-signal convergence.",
+    "reasoning": "3 insiders bought $2M+ in last 5 days, positive sentiment 0.82 across 4 headlines, RSI at 32 (oversold). Strong multi-signal convergence.",
     "signal_sources": ["insider", "news", "price_action"]
   }}
 ]
@@ -134,7 +134,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_news_headlines",
-            "description": "Get recent news headlines and their FinBERT sentiment scores for a ticker. Use this to validate news signal strength.",
+            "description": "Get recent news headlines and their sentiment scores for a ticker. Use this to validate news signal strength.",
             "parameters": {
                 "type": "object",
                 "properties": {
