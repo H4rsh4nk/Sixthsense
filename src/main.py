@@ -144,10 +144,17 @@ def run_live(args):
     exit_manager = ExitManager(config, db)
     position_sizer = PositionSizer(config)
     scorer = SignalScorer(config, db)
+    dry_run = bool(getattr(args, "dry_run", False))
     order_manager = OrderManager(
-        config, db, broker, risk_manager, exit_manager, position_sizer
+        config, db, broker, risk_manager, exit_manager, position_sizer, dry_run=dry_run
     )
     alerts = AlertManager(config)
+    if dry_run:
+        logger.warning(
+            "DRY-RUN MODE: signals, scoring, and sizing run live; "
+            "no broker orders submitted and no DB trade rows written. "
+            "See docs/decisions/0010-agent-as-decision-driver.md (Phase C)."
+        )
 
     # Wire reconcile-on-recovery for sticky failover (see ADR-0004). The
     # callback runs when the broker circuit breaker closes after recovering
@@ -565,6 +572,12 @@ def main():
     # Live/paper trading command
     live = subparsers.add_parser("trade", help="Run live/paper trading")
     live.add_argument("--now", action="store_true", help="Trigger an immediate scan and entry cycle on startup")
+    live.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run signals, scoring, and sizing live but suppress broker submissions and "
+             "trade DB writes. See docs/decisions/0010-agent-as-decision-driver.md (Phase C).",
+    )
     live.add_argument(
         "--force-phase",
         action="append",

@@ -18,7 +18,12 @@ logger = logging.getLogger(__name__)
 
 
 class OrderManager:
-    """Orchestrates trade entries and exits through the broker."""
+    """Orchestrates trade entries and exits through the broker.
+
+    Set ``dry_run=True`` to exercise the full sizing / risk-check / decision-log
+    pipeline without submitting orders to the broker — used by the
+    ``swing-trader trade --dry-run`` flow for end-to-end testing.
+    """
 
     def __init__(
         self,
@@ -28,6 +33,7 @@ class OrderManager:
         risk_manager: RiskManager,
         exit_manager: ExitManager,
         position_sizer: PositionSizer,
+        dry_run: bool = False,
     ):
         self.config = config
         self.db = db
@@ -35,6 +41,7 @@ class OrderManager:
         self.risk_manager = risk_manager
         self.exit_manager = exit_manager
         self.position_sizer = position_sizer
+        self.dry_run = bool(dry_run)
 
         # Track broker order IDs → trade IDs for reconciliation
         self._order_map: dict[str, int] = {}  # broker_order_id → db_trade_id
@@ -77,6 +84,28 @@ class OrderManager:
             logger.info(f"Position size too small for {candidate.ticker} @ ${price:.2f}")
             return None
 
+        today = date.today()
+
+        # Dry-run mode: log the would-be trade and stop here. No broker call,
+        # no DB writes — keeps the test database clean. See ADR-0010 Phase C.
+        if self.dry_run:
+            sizing_tag = size.sizing_mode_used
+            if size.sizing_mode_used == "fractional_kelly" and size.kelly_target_pct is not None:
+                sizing_tag += f"@{size.kelly_target_pct:.4f}"
+            logger.info(
+                "DRY-RUN ENTRY: %s %s x %s @ $%.2f | stop=$%.2f | score=%.2f | "
+                "sizing=%s | reason=%s",
+                candidate.direction.upper(),
+                size.shares,
+                candidate.ticker,
+                price,
+                size.stop_loss_price,
+                candidate.combined_score,
+                sizing_tag,
+                candidate.metadata.get("reasoning", "n/a"),
+            )
+            return None
+
         # Place market order
         order = self.broker.place_market_order(
             ticker=candidate.ticker,
@@ -90,7 +119,6 @@ class OrderManager:
             return None
 
         # Compute target exit date
-        today = date.today()
         target_exit = self.exit_manager.compute_target_exit_date(today)
 
         # Record trade in database
@@ -133,6 +161,12 @@ class OrderManager:
         today = date.today()
         exit_signals = self.exit_manager.check_exits(today, current_prices)
         closed = []
+
+        if self.dry_run and exit_signals:
+            logger.info("DRY-RUN EXITS: would close %d positions", len(exit_signals))
+            for sig in exit_signals:
+                logger.info("  DRY-RUN EXIT: %s reason=%s", sig.ticker, sig.reason)
+            return []
 
         for exit_sig in exit_signals:
             trade_id = exit_sig.trade_id
@@ -180,6 +214,10 @@ class OrderManager:
         """Close all open positions immediately."""
         exits = self.exit_manager.close_all_positions(reason)
         closed = []
+
+        if self.dry_run and exits:
+            logger.info("DRY-RUN CLOSE_ALL: would close %d positions (%s)", len(exits), reason)
+            return []
 
         for exit_sig in exits:
             price = self.broker.get_latest_price(exit_sig.ticker)
