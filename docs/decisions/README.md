@@ -29,6 +29,8 @@ Each ADR has:
 | 0006 | Performance regression detection (not ML retraining) | Accepted | `src/monitoring/regression.py`, `regression_alerts` table |
 | 0007 | Exchange-calendar awareness (`exchange_calendars`) | Accepted | `src/main.py`, new `src/market_calendar.py` |
 | 0008 | Idempotent persisted `phase_state`             | Accepted | `src/database.py`, `src/main.py`       |
+| 0010 | Agent as the decision driver (dual-mode)       | Accepted | `src/agent/tool_registry.py` (Phase A done); Phase B (driver) pending |
+| 0011 | Agent budgets, caching, trace-based observability | Accepted | schema stubs (`tool_call_log`) done; budgets / caching pending Phase B |
 
 Statuses:
 
