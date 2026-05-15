@@ -167,6 +167,28 @@ CREATE TABLE IF NOT EXISTS phase_state (
     detail TEXT                        -- free-form, e.g. ISO datetime for intraday cadence
 );
 
+-- Per-call agent tool log (see ADR-0011). One row per tool invocation.
+-- Schema stub: full population by ADR-0010 Phase B / ADR-0011 Phase β.
+CREATE TABLE IF NOT EXISTS tool_call_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phase_id TEXT NOT NULL,            -- UUID per phase invocation
+    phase_name TEXT NOT NULL,
+    call_idx INTEGER NOT NULL,
+    tool_name TEXT NOT NULL,
+    args_hash TEXT,
+    args_json TEXT,
+    result_summary TEXT,
+    cache_hit INTEGER NOT NULL DEFAULT 0,
+    latency_ms REAL,
+    tokens_in INTEGER,
+    tokens_out INTEGER,
+    cost_usd REAL,
+    error TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_tool_call_phase ON tool_call_log(phase_id);
+CREATE INDEX IF NOT EXISTS idx_tool_call_time ON tool_call_log(created_at);
+
 -- Performance regression alerts (see ADR-0006). Daily post-market job appends
 -- rows; intent is auditability, not deduplication, so each check writes a row.
 CREATE TABLE IF NOT EXISTS regression_alerts (
