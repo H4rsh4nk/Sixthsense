@@ -8,7 +8,7 @@ from datetime import date, datetime
 
 from src.config import AppConfig
 from src.database import Database
-from src.execution.broker import AlpacaBroker
+from src.execution.broker import AlpacaBroker, BrokerCascade
 from src.strategy.exit_manager import ExitManager, ExitSignal
 from src.strategy.position_sizer import PositionSizer, PositionSize
 from src.strategy.risk_manager import RiskManager
@@ -24,7 +24,7 @@ class OrderManager:
         self,
         config: AppConfig,
         db: Database,
-        broker: AlpacaBroker,
+        broker: AlpacaBroker | BrokerCascade,
         risk_manager: RiskManager,
         exit_manager: ExitManager,
         position_sizer: PositionSizer,
@@ -59,13 +59,19 @@ class OrderManager:
             logger.warning(f"Cannot get price for {candidate.ticker}")
             return None
 
-        # Size the position
+        # Size the position. In fractional_kelly mode we pass per-source priors
+        # computed from closed trades; see ADR-0003.
         account = self.broker.get_account()
+        kelly_inputs = None
+        if self.config.trading.sizing_mode == "fractional_kelly":
+            kelly_inputs = self.db.get_signal_kelly_inputs()
         size = self.position_sizer.calculate(
             account_equity=account.equity,
             available_cash=account.cash,
             entry_price=price,
             stop_loss_pct=self.config.exit_rules.stop_loss_pct,
+            signal_sources=candidate.signal_sources,
+            kelly_inputs=kelly_inputs,
         )
         if size is None:
             logger.info(f"Position size too small for {candidate.ticker} @ ${price:.2f}")
@@ -108,10 +114,16 @@ class OrderManager:
 
         self.exit_manager.register_trade(trade_id, price)
 
+        sizing_detail = f"sizing={size.sizing_mode_used}"
+        if size.sizing_mode_used == "fractional_kelly" and size.kelly_target_pct is not None:
+            sizing_detail += f" kelly_target_pct={size.kelly_target_pct:.4f}"
+        elif size.kelly_fallback_reason:
+            sizing_detail += f" kelly_fallback={size.kelly_fallback_reason}"
         logger.info(
             f"ENTERED: {candidate.direction.upper()} {size.shares} x {candidate.ticker} "
             f"@ ${price:.2f} | Stop: ${size.stop_loss_price:.2f} | "
             f"Exit by: {target_exit} | Score: {candidate.combined_score:.2f} | "
+            f"{sizing_detail} | "
             f"Reason: {candidate.metadata.get('reasoning', 'n/a')}"
         )
         return trade_id

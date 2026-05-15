@@ -7,6 +7,11 @@ trading:
   max_single_position_pct: 0.10  # cap each position at 10% while evaluating decisions
   max_sector_positions: 4
   daily_loss_limit_pct: 0.03
+  # Sizing — see docs/decisions/0003-fractional-kelly-sizing.md
+  sizing_mode: fixed_risk          # fixed_risk | fractional_kelly
+  kelly_fraction: 0.25             # multiplier on full Kelly (0 < x ≤ 0.5)
+  kelly_min_trades_per_source: 30  # below this per source, fall back to fixed_risk
+  kelly_max_position_pct: 0.10     # hard cap as fraction of equity
 
 exit_rules:
   default_hold_days: 5
@@ -48,10 +53,21 @@ signals:
     rsi_overbought: 70
     volume_spike_multiplier: 2.0
     weight: 0.20
+  macro:
+    enabled: false  # regime tilt from benchmark (downloads SPY with pipeline when enabled)
+    benchmark_ticker: "SPY"
+    lookback_sessions: 10
+    risk_on_return: 0.02
+    risk_off_return: -0.02
+    tilt_strength: 0.25
+    weight: 0.12
 
 scoring:
   min_combined_score: 0.3
   min_signals_agreeing: 1
+  min_aggregate_confidence: 0.0   # >0 applies confidence gate (mean of signal confidences)
+  conflict_balance_ratio: 0.65    # abstain when long vs short weighted masses this balanced (0 disables)
+  accuracy_weight_adjustment: false  # true ⇒ scale weights via signal_source_stats from closed trades
 
 backtest:
   start_date: "2023-01-01"
@@ -69,6 +85,14 @@ broker:
   base_url_live: "https://api.alpaca.markets"
   entry_delay_minutes: 5  # wait 5 min after open
   exit_before_close_minutes: 5
+  fallback_enabled: false
+  fallback_paper: true
+  fallback_base_url_paper: ""
+  fallback_base_url_live: ""
+  # Sticky failover (circuit breaker). See docs/decisions/0004-sticky-broker-failover.md
+  failover_failure_threshold: 3
+  failover_cooldown_seconds: 300
+  calendar_aware: true  # skip non-trading days, respect NYSE early closes
 
 scheduler:
   pre_market: "08:00"
@@ -84,16 +108,28 @@ alerts:
   telegram_enabled: false
   telegram_chat_id: ""
 
+monitoring:
+  # Performance regression detection — see docs/decisions/0006-performance-regression-not-retraining.md
+  regression_check_enabled: true
+  regression_min_trades: 20         # below this per source, skip win-rate check
+  regression_win_rate_floor: 0.40   # alert if 30-trade win rate dips below this
+  regression_win_rate_delta: 0.10   # AND 30-trade rate trails 90-trade baseline by this
+  regression_sharpe_floor: 0.0      # alert if 30-day Sharpe drops below
+  regression_min_equity_days: 20    # below this many equity snapshots, skip Sharpe
+
 data:
   universe: "sp500"  # sp500 | custom
   custom_tickers: []
   db_path: "data/swing_trader.db"
   price_history_years: 3
+  ingestion:
+    validate_prices: true
+    max_single_day_return_pct: 0.50
 
 agent:
   enabled: true
   provider: "ollama"  # gemini, openai, anthropic, ollama, together, groq, etc.
-  model: "ollama/llama3.1:8b"  # LiteLLM format
+  model: "ollama/qwen3.5:9b"  # LiteLLM format
   temperature: 0.2
   max_tool_calls: 5
   fallback_to_rules: true

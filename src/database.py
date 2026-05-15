@@ -141,6 +141,14 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
     open_positions INTEGER NOT NULL
 );
 
+-- Rolling directional accuracy priors per signal generator (closes update on trade exits)
+CREATE TABLE IF NOT EXISTS signal_source_stats (
+    signal_type TEXT PRIMARY KEY,
+    wins INTEGER NOT NULL DEFAULT 0,
+    losses INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
 -- S&P 500 universe
 CREATE TABLE IF NOT EXISTS universe (
     ticker TEXT PRIMARY KEY,
@@ -150,6 +158,29 @@ CREATE TABLE IF NOT EXISTS universe (
     market_cap REAL,
     updated_at TEXT DEFAULT (datetime('now'))
 );
+
+-- Persisted scheduler phase state (idempotent orchestration; see ADR-0008)
+CREATE TABLE IF NOT EXISTS phase_state (
+    phase_key TEXT PRIMARY KEY,        -- e.g. pre_market, market_open_entry, intraday_check
+    last_run_date TEXT,                -- ISO date the phase last ran (US/Eastern)
+    last_run_at TEXT,                  -- ISO datetime of the last successful run
+    detail TEXT                        -- free-form, e.g. ISO datetime for intraday cadence
+);
+
+-- Performance regression alerts (see ADR-0006). Daily post-market job appends
+-- rows; intent is auditability, not deduplication, so each check writes a row.
+CREATE TABLE IF NOT EXISTS regression_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    check_date TEXT NOT NULL,          -- ISO date the check ran
+    check_time TEXT NOT NULL,          -- ISO datetime when written
+    alert_type TEXT NOT NULL,          -- win_rate | sharpe | drift
+    signal_type TEXT,                  -- per-source for win_rate; NULL for portfolio metrics
+    severity TEXT NOT NULL,            -- info | warning | critical
+    metric_value REAL,                 -- the measured metric (e.g. 0.32 win rate)
+    threshold REAL,                    -- the floor / threshold tripped
+    detail TEXT                        -- short human-readable explanation
+);
+CREATE INDEX IF NOT EXISTS idx_regression_alerts_date ON regression_alerts(check_date);
 """
 
 
@@ -177,6 +208,25 @@ class Database:
                 conn.execute("ALTER TABLE decision_logs ADD COLUMN signal_details TEXT")
             if "agent_trace" not in decision_cols:
                 conn.execute("ALTER TABLE decision_logs ADD COLUMN agent_trace TEXT")
+            if "latency_ms" not in decision_cols:
+                conn.execute("ALTER TABLE decision_logs ADD COLUMN latency_ms REAL")
+            if "model_cost_usd" not in decision_cols:
+                conn.execute("ALTER TABLE decision_logs ADD COLUMN model_cost_usd REAL")
+
+        idx = conn.execute(
+            """SELECT COUNT(1) AS c FROM sqlite_master
+               WHERE type='index' AND name='idx_news_unique_article'"""
+        ).fetchone()["c"]
+        if idx == 0:
+            conn.execute("""
+                DELETE FROM news_articles WHERE id NOT IN (
+                    SELECT MIN(id) FROM news_articles GROUP BY ticker, published_date, headline
+                )
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX idx_news_unique_article
+                ON news_articles(ticker, published_date, headline)
+            """)
 
     @contextmanager
     def connect(self):
@@ -293,7 +343,10 @@ class Database:
         with self.connect() as conn:
             # Get trade entry data
             cursor = conn.execute("SELECT * FROM trades WHERE id = ?", (trade_id,))
-            trade = dict(cursor.fetchone())
+            row = cursor.fetchone()
+            if not row:
+                return
+            trade = dict(row)
 
             pnl = (exit_price - trade["entry_price"]) * trade["shares"]
             if trade["direction"] == "short":
@@ -309,6 +362,22 @@ class Database:
                    WHERE id = ?""",
                 (exit_date, exit_price, exit_reason, pnl, pnl_pct, exit_date, trade_id),
             )
+            outcome_win = bool(pnl > 0)
+            delta_win = 1 if outcome_win else 0
+            delta_loss = 0 if outcome_win else 1
+            for raw in trade["signal_type"].split(","):
+                source = raw.strip()
+                if not source:
+                    continue
+                conn.execute(
+                    """INSERT INTO signal_source_stats (signal_type, wins, losses)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(signal_type) DO UPDATE SET
+                           wins = wins + excluded.wins,
+                           losses = losses + excluded.losses,
+                           updated_at = datetime('now')""",
+                    (source, delta_win, delta_loss),
+                )
 
     def get_open_trades(self) -> list[dict]:
         """Get all currently open trades."""
@@ -318,17 +387,176 @@ class Database:
             )
             return [dict(row) for row in cursor.fetchall()]
 
+    def get_signal_accuracy_multipliers(self, prior_weight: float = 4.0) -> dict[str, float]:
+        """Map signal_type → weight multiplier from closed-trade win rate (Beta prior)."""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT signal_type, wins, losses FROM signal_source_stats"
+            ).fetchall()
+        multipliers: dict[str, float] = {}
+        hw = prior_weight / 2.0
+        for row in rows:
+            w, l = int(row["wins"]), int(row["losses"])
+            rate = (w + hw) / (w + l + prior_weight)
+            multipliers[row["signal_type"]] = max(0.65, min(1.35, 0.65 + rate * 0.75))
+        return multipliers
+
+    def count_signals_recent(self, days: int = 1) -> dict[str, int]:
+        """Per signal_type persisted row counts since N days ago (created_at timestamps)."""
+
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """SELECT signal_type, COUNT(*) AS c FROM signals
+                   WHERE datetime(created_at) >= datetime('now', ?)
+                   GROUP BY signal_type""",
+                (f"-{int(days)} day",),
+            )
+            return {row["signal_type"]: int(row["c"]) for row in cursor.fetchall()}
+
     def insert_decision_logs(self, rows: list[dict]):
-        """Bulk insert decision trace rows."""
+        """Bulk insert decision trace rows.
+
+        New optional columns latency_ms and model_cost_usd default to NULL when
+        callers don't supply them. See ADR-0006 (observability) and
+        `CURRENT_DESIGN_ARCHITECTURE.md` §8.
+        """
         if not rows:
             return
+        normalized = []
+        for row in rows:
+            r = dict(row)
+            r.setdefault("latency_ms", None)
+            r.setdefault("model_cost_usd", None)
+            normalized.append(r)
         with self.connect() as conn:
             conn.executemany(
                 """INSERT INTO decision_logs
                    (decision_time, decision_date, stage, mode, ticker, direction, score,
-                    selected, signal_sources, reasoning, rejection_reason, signal_details, agent_trace)
+                    selected, signal_sources, reasoning, rejection_reason, signal_details, agent_trace,
+                    latency_ms, model_cost_usd)
                    VALUES (:decision_time, :decision_date, :stage, :mode, :ticker, :direction, :score,
-                           :selected, :signal_sources, :reasoning, :rejection_reason, :signal_details, :agent_trace)""",
+                           :selected, :signal_sources, :reasoning, :rejection_reason, :signal_details, :agent_trace,
+                           :latency_ms, :model_cost_usd)""",
+                normalized,
+            )
+
+    def load_phase_state(self) -> dict[str, dict]:
+        """Load all persisted phase rows. See ADR-0008."""
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "SELECT phase_key, last_run_date, last_run_at, detail FROM phase_state"
+            )
+            return {row["phase_key"]: dict(row) for row in cursor.fetchall()}
+
+    def set_phase_state(
+        self,
+        phase_key: str,
+        last_run_date: str | None,
+        last_run_at: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Upsert a phase row. See ADR-0008."""
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO phase_state (phase_key, last_run_date, last_run_at, detail)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(phase_key) DO UPDATE SET
+                       last_run_date = excluded.last_run_date,
+                       last_run_at = excluded.last_run_at,
+                       detail = excluded.detail""",
+                (phase_key, last_run_date, last_run_at, detail),
+            )
+
+    def clear_phase_state(self, phase_key: str) -> None:
+        """Erase a phase row so the next tick re-runs it (used by --force-phase)."""
+        with self.connect() as conn:
+            conn.execute("DELETE FROM phase_state WHERE phase_key = ?", (phase_key,))
+
+    def get_signal_kelly_inputs(self) -> dict[str, dict]:
+        """Per signal_type Kelly inputs derived from closed trades.
+
+        Returns mapping `signal_type -> {n, wins, losses, avg_win_pct, avg_loss_pct}`.
+        The `trades.signal_type` column is comma-separated (a candidate may carry
+        multiple sources); each row contributes to every named source. PnL is
+        attributed equally across sources — a fair-share approximation, since we
+        can't recover the per-source contribution after the fact.
+
+        Used by `PositionSizer` in `fractional_kelly` mode. See ADR-0003.
+        """
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT signal_type, pnl_pct
+                   FROM trades
+                   WHERE status = 'closed' AND pnl_pct IS NOT NULL"""
+            ).fetchall()
+
+        acc: dict[str, dict] = {}
+        for row in rows:
+            sources = [s.strip() for s in (row["signal_type"] or "").split(",") if s.strip()]
+            if not sources:
+                continue
+            pnl = float(row["pnl_pct"])
+            for src in sources:
+                d = acc.setdefault(
+                    src,
+                    {"wins": 0, "losses": 0, "sum_win_pct": 0.0, "sum_loss_pct": 0.0},
+                )
+                if pnl > 0:
+                    d["wins"] += 1
+                    d["sum_win_pct"] += pnl
+                elif pnl < 0:
+                    d["losses"] += 1
+                    d["sum_loss_pct"] += abs(pnl)
+
+        result: dict[str, dict] = {}
+        for src, d in acc.items():
+            wins, losses = d["wins"], d["losses"]
+            n = wins + losses
+            result[src] = {
+                "n": n,
+                "wins": wins,
+                "losses": losses,
+                "avg_win_pct": (d["sum_win_pct"] / wins) if wins else 0.0,
+                "avg_loss_pct": (d["sum_loss_pct"] / losses) if losses else 0.0,
+            }
+        return result
+
+    def get_recent_closed_trades(self, limit: int = 200) -> list[dict]:
+        """Most recent closed trades, newest first. Used by regression detection."""
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """SELECT id, ticker, signal_type, pnl, pnl_pct, exit_date, entry_date
+                   FROM trades
+                   WHERE status = 'closed' AND pnl_pct IS NOT NULL
+                   ORDER BY exit_date DESC, id DESC
+                   LIMIT ?""",
+                (limit,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_recent_equity_snapshots(self, days: int = 120) -> list[dict]:
+        """Most recent equity snapshots, oldest first (for Sharpe computation)."""
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """SELECT * FROM (
+                       SELECT * FROM equity_snapshots ORDER BY date DESC LIMIT ?
+                   ) ORDER BY date ASC""",
+                (int(days),),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def insert_regression_alerts(self, rows: list[dict]) -> None:
+        """Bulk insert regression-alert rows (see ADR-0006)."""
+        if not rows:
+            return
+        with self.connect() as conn:
+            conn.executemany(
+                """INSERT INTO regression_alerts
+                   (check_date, check_time, alert_type, signal_type,
+                    severity, metric_value, threshold, detail)
+                   VALUES (:check_date, :check_time, :alert_type, :signal_type,
+                           :severity, :metric_value, :threshold, :detail)""",
                 rows,
             )
 

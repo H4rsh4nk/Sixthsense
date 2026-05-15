@@ -6,10 +6,11 @@ import argparse
 import json
 import logging
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 from src.config import ROOT_DIR, load_config
+from src import market_calendar
 
 # Setup logging
 LOG_DIR = ROOT_DIR / "logs"
@@ -68,6 +69,7 @@ def run_backtest(args):
     from src.signals.insider import InsiderSignal
     from src.signals.news import NewsSignal
     from src.signals.political import PoliticalSignal
+    from src.signals.macro import MacroSignal
     from src.signals.price_action import PriceActionSignal
 
     # Initialize database and load data
@@ -88,6 +90,8 @@ def run_backtest(args):
         signals.append(PoliticalSignal(config, db))
     if config.signals.price_action.enabled:
         signals.append(PriceActionSignal(config, db))
+    if config.signals.macro.enabled:
+        signals.append(MacroSignal(config, db))
 
     if not signals:
         logger.error("No signals enabled. Enable at least one in config/settings.yaml")
@@ -117,15 +121,17 @@ def run_live(args):
     config = load_config()
 
     from apscheduler.schedulers.blocking import BlockingScheduler
-    from apscheduler.triggers.cron import CronTrigger
     import pytz
 
     from src.database import Database
-    from src.execution.broker import AlpacaBroker
+    from src.execution.broker import create_execution_broker
     from src.execution.order_manager import OrderManager
+    from src.monitoring.alerts import AlertManager
+    from src.monitoring import regression as regression_monitor
     from src.signals.insider import InsiderSignal
     from src.signals.news import NewsSignal
     from src.signals.political import PoliticalSignal
+    from src.signals.macro import MacroSignal
     from src.signals.price_action import PriceActionSignal
     from src.strategy.exit_manager import ExitManager
     from src.strategy.position_sizer import PositionSizer
@@ -133,7 +139,7 @@ def run_live(args):
     from src.strategy.scorer import SignalScorer
 
     db = Database(config)
-    broker = AlpacaBroker(config)
+    broker = create_execution_broker(config)
     risk_manager = RiskManager(config, db)
     exit_manager = ExitManager(config, db)
     position_sizer = PositionSizer(config)
@@ -141,6 +147,13 @@ def run_live(args):
     order_manager = OrderManager(
         config, db, broker, risk_manager, exit_manager, position_sizer
     )
+    alerts = AlertManager(config)
+
+    # Wire reconcile-on-recovery for sticky failover (see ADR-0004). The
+    # callback runs when the broker circuit breaker closes after recovering
+    # from a primary outage. AlpacaBroker (single-leg) has no breaker.
+    if hasattr(broker, "set_recovery_callback"):
+        broker.set_recovery_callback(order_manager.reconcile)
 
     # Initialize signal generators
     signal_generators = []
@@ -152,6 +165,8 @@ def run_live(args):
         signal_generators.append(PoliticalSignal(config, db))
     if config.signals.price_action.enabled:
         signal_generators.append(PriceActionSignal(config, db))
+    if config.signals.macro.enabled:
+        signal_generators.append(MacroSignal(config, db))
 
     tz = pytz.timezone(config.scheduler.timezone)
 
@@ -254,14 +269,18 @@ def run_live(args):
         try:
             account = broker.get_account()
             status = risk_manager.get_status(account.equity)
+            sg = db.count_signals_recent(days=7)
+            sg_part = "".join(f" {k}:{v}" for k, v in sorted(sg.items())) if sg else " none"
             logger.info(
-                "HEARTBEAT | mode=%s | equity=$%0.2f | open_positions=%s/%s | drawdown=%0.2f%% | circuit_breaker=%s",
+                "HEARTBEAT | mode=%s | equity=$%0.2f | open_positions=%s/%s | drawdown=%0.2f%% | circuit_breaker=%s"
+                "| signal_rows_7d=%s",
                 "PAPER" if config.broker.paper else "LIVE",
                 account.equity,
                 status["open_positions"],
                 status["max_positions"],
                 status["drawdown_pct"] * 100,
                 status["circuit_breaker_active"],
+                sg_part,
             )
         except Exception as e:
             logger.error(f"HEARTBEAT FAILED: {e}")
@@ -291,9 +310,19 @@ def run_live(args):
         logger.info(f"  Equity: ${account.equity:,.2f} | Drawdown: {drawdown:.2%} | "
                      f"Open: {len(open_trades)} positions")
 
-    def overnight_data_refresh():
-        """Overnight: refresh data from external sources."""
-        logger.info("=== OVERNIGHT DATA REFRESH ===")
+        # Performance regression detection — ADR-0006. Runs after the equity
+        # snapshot so today's row is included in the rolling window.
+        if config.monitoring.regression_check_enabled:
+            try:
+                regression_monitor.run_check(
+                    db, config, alerts, when=datetime.now(tz)
+                )
+            except Exception as e:  # noqa: BLE001 - monitoring is best-effort
+                logger.error("Regression check failed: %s", e)
+
+    def post_market_refresh():
+        """Post-market: refresh external datasets."""
+        logger.info("=== POST-MARKET DATA REFRESH ===")
         for gen in signal_generators:
             if hasattr(gen, "fetch_and_store_events"):
                 try:
@@ -308,56 +337,211 @@ def run_live(args):
                     except Exception:
                         pass
 
+    def parse_hhmm(value: str) -> time:
+        hh, mm = map(int, value.split(":"))
+        return time(hour=hh, minute=mm)
+
+    sched = config.scheduler
+    pre_market_t = parse_hhmm(sched.pre_market)
+    market_open_t = parse_hhmm(sched.market_open_entry)
+    market_close_t = parse_hhmm(sched.market_close_exit)
+    post_market_t = parse_hhmm(sched.post_market)
+    overnight_t = parse_hhmm(sched.overnight_scan)
+
+    # Buffer (minutes) the configured market_close_exit lives ahead of the
+    # regular 16:00 ET close. Re-applied on early-close days so we still flat
+    # positions before the bell. See ADR-0007.
+    close_buffer_minutes = max(
+        0, (16 * 60) - (market_close_t.hour * 60 + market_close_t.minute)
+    )
+
+    def effective_close_time(today: date) -> time:
+        """Compute today's effective market-close exit time.
+
+        Honors NYSE early-close sessions when calendar awareness is enabled.
+        Falls back to the static config value otherwise.
+        """
+        if not config.broker.calendar_aware:
+            return market_close_t
+        cal_close = market_calendar.session_close_time(today)
+        if cal_close is None or cal_close >= time(16, 0):
+            return market_close_t
+        # Early close: apply the same pre-close buffer as the regular config.
+        cal_dt = datetime.combine(today, cal_close) - timedelta(minutes=close_buffer_minutes)
+        return cal_dt.time()
+
+    # ---- persisted phase state (idempotency; see ADR-0008) ----------------
+
+    _STATE_KEYS = (
+        "pre_market",
+        "market_open_entry",
+        "post_market_review",
+        "post_market_refresh",
+        "intraday_check",
+    )
+
+    def _load_persisted_phase_state() -> dict:
+        rows = db.load_phase_state()
+        out: dict = {
+            "pre_market_date": None,
+            "market_open_entry_date": None,
+            "post_market_review_date": None,
+            "post_market_refresh_date": None,
+            "last_intraday_check": None,
+        }
+        for key in _STATE_KEYS:
+            row = rows.get(key)
+            if not row:
+                continue
+            if key == "intraday_check":
+                detail = row.get("detail") or row.get("last_run_at")
+                if detail:
+                    try:
+                        out["last_intraday_check"] = datetime.fromisoformat(detail)
+                    except ValueError:
+                        out["last_intraday_check"] = None
+            else:
+                out[f"{key}_date"] = row.get("last_run_date")
+        return out
+
+    phase_state = _load_persisted_phase_state()
+    logger.info(
+        "Loaded persisted phase_state: pre_market=%s market_open_entry=%s "
+        "post_market_review=%s post_market_refresh=%s last_intraday_check=%s",
+        phase_state["pre_market_date"],
+        phase_state["market_open_entry_date"],
+        phase_state["post_market_review_date"],
+        phase_state["post_market_refresh_date"],
+        phase_state["last_intraday_check"],
+    )
+
+    def _mark_phase(key: str, today_iso: str, *, detail: str | None = None) -> None:
+        """Persist phase row after a successful run. See ADR-0008."""
+        db.set_phase_state(
+            key,
+            today_iso,
+            datetime.utcnow().isoformat(),
+            detail,
+        )
+
+    def get_market_phase(now_local: datetime, close_t: time) -> str:
+        current = now_local.time()
+        if pre_market_t <= current < market_open_t:
+            return "pre_market"
+        if market_open_t <= current < close_t:
+            return "in_market"
+        return "post_market"
+
+    def phase_orchestrator():
+        """Single 24/7 orchestrator that routes work by market phase."""
+        now_local = datetime.now(tz)
+        today_date = now_local.date()
+        today = today_date.isoformat()
+        is_trading = (
+            market_calendar.is_trading_day(today_date)
+            if config.broker.calendar_aware
+            else (now_local.weekday() < 5)
+        )
+        close_t = effective_close_time(today_date)
+        phase = get_market_phase(now_local, close_t)
+        logger.info(
+            "=== PHASE ORCHESTRATOR === phase=%s time=%s close=%s trading_day=%s",
+            phase,
+            now_local.strftime("%H:%M:%S"),
+            close_t.strftime("%H:%M"),
+            is_trading,
+        )
+
+        if not is_trading:
+            logger.info(
+                "Non-trading day — skipping trading jobs, allowing post-market refresh only"
+            )
+            if (
+                now_local.time() >= overnight_t
+                and phase_state["post_market_refresh_date"] != today
+            ):
+                post_market_refresh()
+                phase_state["post_market_refresh_date"] = today
+                _mark_phase("post_market_refresh", today)
+            return
+
+        if phase == "pre_market":
+            if phase_state["pre_market_date"] != today:
+                pre_market_scan()
+                phase_state["pre_market_date"] = today
+                _mark_phase("pre_market", today)
+            return
+
+        if phase == "in_market":
+            if phase_state["market_open_entry_date"] != today:
+                market_open_entry()
+                phase_state["market_open_entry_date"] = today
+                _mark_phase("market_open_entry", today)
+
+            last_intraday = phase_state["last_intraday_check"]
+            interval_minutes = sched.intraday_check_interval_minutes
+            should_run_intraday = (
+                last_intraday is None
+                or (now_local - last_intraday).total_seconds() >= interval_minutes * 60
+            )
+            if should_run_intraday:
+                intraday_check()
+                phase_state["last_intraday_check"] = now_local
+                _mark_phase("intraday_check", today, detail=now_local.isoformat())
+            return
+
+        # post_market phase
+        if now_local.time() >= post_market_t and phase_state["post_market_review_date"] != today:
+            post_market_review()
+            phase_state["post_market_review_date"] = today
+            _mark_phase("post_market_review", today)
+
+        if now_local.time() >= overnight_t and phase_state["post_market_refresh_date"] != today:
+            post_market_refresh()
+            phase_state["post_market_refresh_date"] = today
+            _mark_phase("post_market_refresh", today)
+
     # Setup scheduler
     scheduler = BlockingScheduler(timezone=tz)
-
-    # Parse schedule times
-    sched = config.scheduler
-    pre_h, pre_m = map(int, sched.pre_market.split(":"))
-    entry_h, entry_m = map(int, sched.market_open_entry.split(":"))
-    close_h, close_m = map(int, sched.market_close_exit.split(":"))
-    post_h, post_m = map(int, sched.post_market.split(":"))
-    night_h, night_m = map(int, sched.overnight_scan.split(":"))
-
-    scheduler.add_job(pre_market_scan, CronTrigger(
-        hour=pre_h, minute=pre_m, day_of_week="mon-fri"
-    ), id="pre_market")
-
-    scheduler.add_job(market_open_entry, CronTrigger(
-        hour=entry_h, minute=entry_m, day_of_week="mon-fri"
-    ), id="market_open")
-
-    scheduler.add_job(intraday_check, "interval",
-        minutes=sched.intraday_check_interval_minutes,
-        id="intraday"
-    )
-
-    scheduler.add_job(heartbeat, "interval",
-        minutes=sched.heartbeat_interval_minutes,
-        id="heartbeat"
-    )
-
-    scheduler.add_job(post_market_review, CronTrigger(
-        hour=post_h, minute=post_m, day_of_week="mon-fri"
-    ), id="post_market")
-
-    scheduler.add_job(overnight_data_refresh, CronTrigger(
-        hour=night_h, minute=night_m, day_of_week="mon-fri"
-    ), id="overnight")
+    scheduler.add_job(phase_orchestrator, "interval", minutes=1, id="phase_orchestrator")
+    scheduler.add_job(heartbeat, "interval", minutes=sched.heartbeat_interval_minutes, id="heartbeat")
 
     mode = "PAPER" if config.broker.paper else "LIVE"
     decision_mode = f"AI Agent ({config.agent.model})" if config.agent.enabled else "Rules"
     logger.info(f"Starting swing-trader in {mode} mode...")
     logger.info(f"Decision mode: {decision_mode}")
-    logger.info(f"Schedule: pre={sched.pre_market}, entry={sched.market_open_entry}, "
-                f"close={sched.market_close_exit}, post={sched.post_market}")
+    logger.info(
+        f"24/7 phases: pre_market={sched.pre_market}->{sched.market_open_entry}, "
+        f"in_market={sched.market_open_entry}->{sched.market_close_exit}, "
+        f"post_market=all other times"
+    )
     logger.info(f"Heartbeat interval: every {sched.heartbeat_interval_minutes} minutes")
+    if config.broker.calendar_aware:
+        logger.info("Calendar awareness: %s", market_calendar.summary(datetime.now(tz).date()))
+    else:
+        logger.info("Calendar awareness: disabled (weekday-only check)")
+
+    # --force-phase support: clear persisted phase rows so the next tick re-runs them.
+    forced_phases = list(getattr(args, "force_phase", None) or [])
+    for raw in forced_phases:
+        key = raw.strip()
+        if key not in _STATE_KEYS:
+            logger.warning(
+                "--force-phase: unknown phase '%s' (expected one of %s); ignoring",
+                key, ", ".join(_STATE_KEYS),
+            )
+            continue
+        db.clear_phase_state(key)
+        if key == "intraday_check":
+            phase_state["last_intraday_check"] = None
+        else:
+            phase_state[f"{key}_date"] = None
+        logger.info("Cleared persisted phase '%s' — it will run on the next tick", key)
 
     try:
         if getattr(args, "now", False):
-            logger.info("Executing immediate manual scan (--now flag passed)")
-            pre_market_scan()
-            market_open_entry()
+            logger.info("Executing immediate phase orchestration cycle (--now flag passed)")
+            phase_orchestrator()
             
         scheduler.start()
     except KeyboardInterrupt:
@@ -381,6 +565,19 @@ def main():
     # Live/paper trading command
     live = subparsers.add_parser("trade", help="Run live/paper trading")
     live.add_argument("--now", action="store_true", help="Trigger an immediate scan and entry cycle on startup")
+    live.add_argument(
+        "--force-phase",
+        action="append",
+        choices=[
+            "pre_market",
+            "market_open_entry",
+            "intraday_check",
+            "post_market_review",
+            "post_market_refresh",
+        ],
+        help="Clear the persisted phase row so it re-runs on the next tick. "
+             "Repeat to force multiple phases. See docs/decisions/0008-idempotent-phase-state.md.",
+    )
 
     # Data download command
     data = subparsers.add_parser("download", help="Download historical data only")

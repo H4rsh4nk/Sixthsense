@@ -23,6 +23,11 @@ class TradingConfig(BaseModel):
     max_single_position_pct: float = 0.30
     max_sector_positions: int = 2
     daily_loss_limit_pct: float = 0.03
+    # Sizing — see docs/decisions/0003-fractional-kelly-sizing.md
+    sizing_mode: Literal["fixed_risk", "fractional_kelly"] = "fixed_risk"
+    kelly_fraction: float = 0.25            # multiplier on full Kelly; 0 < x ≤ 0.5
+    kelly_min_trades_per_source: int = 30   # below this per source, fall back to fixed_risk
+    kelly_max_position_pct: float = 0.10    # hard cap as fraction of equity
 
 
 class ExitRulesConfig(BaseModel):
@@ -66,16 +71,39 @@ class PriceActionSignalConfig(BaseModel):
     weight: float = 0.20
 
 
+class MacroSignalConfig(BaseModel):
+    """Broad market regime tilt from benchmark momentum (maps to macro agent analogue)."""
+
+    enabled: bool = False
+    benchmark_ticker: str = "SPY"
+    lookback_sessions: int = 10
+    risk_on_return: float = 0.02  # cumulative return threshold for mild risk-on tilt
+    risk_off_return: float = -0.02  # cumulative return threshold for mild risk-off tilt
+    tilt_strength: float = 0.25  # signal strength magnitude when tilt active (scaled)
+    weight: float = 0.12
+
+
 class SignalsConfig(BaseModel):
     insider: InsiderSignalConfig = Field(default_factory=InsiderSignalConfig)
     news: NewsSignalConfig = Field(default_factory=NewsSignalConfig)
     political: PoliticalSignalConfig = Field(default_factory=PoliticalSignalConfig)
     price_action: PriceActionSignalConfig = Field(default_factory=PriceActionSignalConfig)
+    macro: MacroSignalConfig = Field(default_factory=MacroSignalConfig)
 
 
 class ScoringConfig(BaseModel):
     min_combined_score: float = 0.3
     min_signals_agreeing: int = 1
+    # Below this mean confidence across participating signals ⇒ abstain. 0 disables the gate.
+    min_aggregate_confidence: float = 0.0
+    # Compare balanced long vs short weighted mass (min/max). Abstain if ratio ≥ threshold. 0 disables.
+    conflict_balance_ratio: float = 0.65  # empirical win-rate multipliers from signal_source_stats
+    accuracy_weight_adjustment: bool = False
+
+
+class IngestionConfig(BaseModel):
+    validate_prices: bool = True
+    max_single_day_return_pct: float = 0.50  # |day return| above this ⇒ drop row
 
 
 class BacktestConfig(BaseModel):
@@ -95,6 +123,14 @@ class BrokerConfig(BaseModel):
     base_url_live: str = "https://api.alpaca.markets"
     entry_delay_minutes: int = 5
     exit_before_close_minutes: int = 5
+    fallback_enabled: bool = False  # alternate Alpaca keys (circuit-breaker-style switch)
+    fallback_paper: bool = True
+    fallback_base_url_paper: str = ""
+    fallback_base_url_live: str = ""
+    # Sticky failover (circuit breaker). See docs/decisions/0004-sticky-broker-failover.md
+    failover_failure_threshold: int = 3       # consecutive primary failures to trip the breaker
+    failover_cooldown_seconds: int = 300      # seconds to stay 'open' before probing primary
+    calendar_aware: bool = True               # use exchange_calendars to skip holidays / early close
 
 
 class SchedulerConfig(BaseModel):
@@ -113,11 +149,23 @@ class AlertsConfig(BaseModel):
     telegram_chat_id: str = ""
 
 
+class MonitoringConfig(BaseModel):
+    """Performance regression detection — see docs/decisions/0006-performance-regression-not-retraining.md."""
+
+    regression_check_enabled: bool = True
+    regression_min_trades: int = 20       # below this per source, skip win-rate check
+    regression_win_rate_floor: float = 0.40  # alert if 30-trade win rate falls below
+    regression_win_rate_delta: float = 0.10  # AND 90-trade baseline drops by ≥ this much
+    regression_sharpe_floor: float = 0.0     # alert if 30-day Sharpe below
+    regression_min_equity_days: int = 20     # below this many snapshots, skip Sharpe
+
+
 class DataConfig(BaseModel):
     universe: Literal["sp500", "custom"] = "sp500"
     custom_tickers: list[str] = Field(default_factory=list)
     db_path: str = "data/swing_trader.db"
     price_history_years: int = 3
+    ingestion: IngestionConfig = Field(default_factory=IngestionConfig)
 
 
 class AgentConfig(BaseModel):
@@ -138,6 +186,8 @@ class LoggingConfig(BaseModel):
 class SecretsConfig(BaseModel):
     alpaca_api_key: str = ""
     alpaca_secret_key: str = ""
+    alpaca_fallback_api_key: str = ""
+    alpaca_fallback_secret_key: str = ""
     telegram_bot_token: str = ""
     sec_edgar_user_agent: str = ""
     llm_api_key: str = ""  # API key for the LLM provider (Gemini/OpenAI/Anthropic/etc.)
@@ -152,6 +202,7 @@ class AppConfig(BaseModel):
     broker: BrokerConfig = Field(default_factory=BrokerConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
+    monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
     data: DataConfig = Field(default_factory=DataConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
@@ -174,12 +225,17 @@ def load_config(settings_path: Path | None = None, secrets_path: Path | None = N
             secrets_data = yaml.safe_load(f) or {}
 
     # Flatten secrets into the config
+    _afb = secrets_data.get("alpaca_fallback", {})
     secrets = SecretsConfig(
         alpaca_api_key=os.getenv(
             "ALPACA_API_KEY", secrets_data.get("alpaca", {}).get("api_key", "")
         ),
         alpaca_secret_key=os.getenv(
             "ALPACA_SECRET_KEY", secrets_data.get("alpaca", {}).get("secret_key", "")
+        ),
+        alpaca_fallback_api_key=os.getenv("ALPACA_FALLBACK_API_KEY", _afb.get("api_key", "")),
+        alpaca_fallback_secret_key=os.getenv(
+            "ALPACA_FALLBACK_SECRET_KEY", _afb.get("secret_key", "")
         ),
         telegram_bot_token=os.getenv(
             "TELEGRAM_BOT_TOKEN", secrets_data.get("telegram", {}).get("bot_token", "")
